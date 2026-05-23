@@ -1,0 +1,94 @@
+include ../../imports.mak
+
+#######################
+# project information #
+#######################
+
+PROJECT_NAME := rpmsg_counter
+SUPPORTED_PROCESSORS := am62x
+# Does the PRU code have dependencies outside of the open-pru repo?
+PRU_DEPENDENCIES :=
+# Use NON_PRU_DEPENDENCIES to select which makefiles to call for non-PRU cores
+NON_PRU_DEPENDENCIES := linux
+
+###################
+# Prebuild checks #
+###################
+BUILD_PROJECT := y
+DEVICE_NON_PRU :=
+
+# Only build project if $(DEVICE) is in $(SUPPORTED_PROCESSORS)
+ifeq (,$(findstring $(DEVICE),$(SUPPORTED_PROCESSORS)))
+BUILD_PROJECT := n
+MESSAGE := Project $(PROJECT_NAME) does not have a build option for $(DEVICE)
+endif
+
+# Only build project if PRU dependencies exist
+ifneq (,$(PRU_DEPENDENCIES))
+# MCU+ SDK dependency?
+ifeq (mcuplus,$(findstring mcuplus,$(PRU_DEPENDENCIES)))
+ifneq ($(BUILD_MCUPLUS),y)
+BUILD_PROJECT := n
+MESSAGE ?= Project $(PROJECT_NAME) depends on MCU+ SDK, but BUILD_MCUPLUS != y.
+endif
+endif
+endif
+
+# Only build non-PRU code if the non-PRU code is enabled in imports.mak
+ifeq ($(BUILD_MCUPLUS),y)
+ifeq (mcuplus,$(findstring mcuplus,$(NON_PRU_DEPENDENCIES)))
+DEVICE_NON_PRU += $(DEVICE)_mcuplus
+endif
+endif
+ifeq ($(BUILD_LINUX),y)
+ifeq (linux,$(findstring linux,$(NON_PRU_DEPENDENCIES)))
+DEVICE_NON_PRU += $(DEVICE)_linux
+endif
+endif
+
+###########################
+# Make and clean commands #
+###########################
+
+ifeq ($(BUILD_PROJECT),y)
+# "make" or "make all" builds projects that match $(DEVICE) set in imports.mak
+# "make" builds PRU firmware first, then host (non-PRU) code
+all: MESSAGE = "Building $(PROJECT_NAME) for $(DEVICE)"
+all: pre_build_message
+	$(MAKE) pru
+	$(MAKE) host
+
+# "make pru" builds only PRU firmware for $(DEVICE)
+pru: ARGUMENTS_PRU = all
+pru: $(DEVICE)
+
+# "make host" builds only host (non-PRU) code for $(DEVICE)
+host: ARGUMENTS_LINUX = all
+host: $(DEVICE_NON_PRU)
+
+# "make clean" cleans projects that match $(DEVICE) set in imports.mak
+clean: ARGUMENTS_PRU = clean
+clean: ARGUMENTS_LINUX = clean
+clean: MESSAGE = "Cleaning $(PROJECT_NAME) for $(DEVICE)"
+clean: pre_build_message $(DEVICE) $(DEVICE_NON_PRU)
+
+else
+# if a prebuild check failed, print message and exit
+all clean pru host: pre_build_message
+endif
+
+pre_build_message:
+	@echo $(MESSAGE)
+
+######################
+# Target definitions #
+######################
+
+# provide target definitions for each supported processor
+am62x:
+# am62x-sk PRU0 only
+	$(MAKE) -C firmware/am62x-sk/pruss0_pru0_fw/ti-pru-cgt $(ARGUMENTS_PRU)
+
+# Linux host application
+am62x_linux:
+	$(MAKE) -C linux/rpmsg_counter_receiver $(ARGUMENTS_LINUX)
