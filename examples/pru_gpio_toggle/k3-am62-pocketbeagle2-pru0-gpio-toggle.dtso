@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * Copyright (C) 2026
+ * 
+ * Device Tree Overlay for PRU GPIO output on PocketBeagle2 / BeaglePlay (AM62x)
+ * Configures PR0_PRU0_GPO8 (U22 -> HP2-2) as PRU GPIO output
+ * AM62x PRU GPIOs use Mux Mode 5
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include "ti/k3-pinctrl.h"
+
+&{/chosen} {
+    overlays {
+        k3-am62-pocketbeagle2-pru0-gpio-toggle.kernel = __TIMESTAMP__;
+    };
+};
+
+&main_pmx0 {
+    pru0_pins_output: pru0-pins {
+        pinctrl-single,pins = <
+            AM62X_IOPAD(0x0100, PIN_OUTPUT, 5) /* (U22) VOUT0_DATA18.PR0_PRU0_GPO8 */
+        >;
+    };
+};
+
+&pru0 {
+    pinctrl-names = "default";
+    pinctrl-0 = <&pru0_pins_output>;
+    status = "okay";
+};
