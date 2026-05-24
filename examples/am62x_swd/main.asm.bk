@@ -1,0 +1,254 @@
+; SWD IDCODE: 55bit reset + 0xA5 + park + TRN (TX-only mode, Linux sets pinmux)
+    .retain
+    .retainrefs
+    .global main
+    .sect ".text"
+    .asg 16666667, DELAY_100MS
+
+main:
+    ; Initialize GPIO
+    zero &r0, 120
+    set r30.t8
+    set r30.t9
+
+rst:
+    ; 51-cycle reset: DIO=1
+    ldi r2, 51
+j2s:
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+    sub r2,r2,1
+    set r30.t8
+    .loop 10
+    nop
+    .endloop
+    qbne j2s,r2,0
+
+    ; 4 idle cycles: DIO=0, CLK toggles
+    clr r30.t9
+    nop
+    nop
+    ldi r2, 4
+idl_pre:
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+    sub r2,r2,1
+    set r30.t8
+    .loop 10
+    nop
+    .endloop
+    qbne idl_pre,r2,0
+    ; end idle: CLK=0, DIO=0 (ready for start bit)
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+
+    ; Send 0xA5 unrolled (8 bits, no loop overhead)
+    ; 0xA5 = 1 0 1 0 0 1 0 1 (LSB first)
+    ldi r4.w0, 0x0000
+    ; bit0=1: DIO=1, CLK=1→0
+    ldi r5.w0, 0x0300
+    or r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ldi r5.w0, 0xFEFF
+    and r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ; bit1=0: DIO=0, CLK=1→0
+    ldi r5.w0, 0xFDFF
+    and r4, r4, r5
+    ldi r5.w0, 0x0100
+    or r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ldi r5.w0, 0xFEFF
+    and r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ; bit2=1: DIO=1, CLK=1→0
+    ldi r5.w0, 0x0300
+    or r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ldi r5.w0, 0xFEFF
+    and r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ; bit3=0: DIO=0, CLK=1→0
+    ldi r5.w0, 0xFDFF
+    and r4, r4, r5
+    ldi r5.w0, 0x0100
+    or r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ldi r5.w0, 0xFEFF
+    and r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ; bit4=0: DIO=0, CLK=1→0
+    ldi r5.w0, 0xFDFF
+    and r4, r4, r5
+    ldi r5.w0, 0x0100
+    or r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ldi r5.w0, 0xFEFF
+    and r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ; bit5=1: DIO=1, CLK=1→0
+    ldi r5.w0, 0x0300
+    or r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ldi r5.w0, 0xFEFF
+    and r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ; bit6=0: DIO=0, CLK=1→0
+    ldi r5.w0, 0xFDFF
+    and r4, r4, r5
+    ldi r5.w0, 0x0100
+    or r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ldi r5.w0, 0xFEFF
+    and r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ; bit7=1: DIO=1, CLK=1→0
+    ldi r5.w0, 0x0300
+    or r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    ldi r5.w0, 0xFEFF
+    and r4, r4, r5
+    mov r30, r4
+    .loop 10
+    nop
+    .endloop
+    
+    ; DISABLED: Switch V24 to RX mode (PRU_GPI9) via c29
+    ; ldi32 r3, MODE_PRU_GPI_PULLUP
+    ; sbco  &r3, c29, PADCFG_V24_OFFSET, 4
+    ; nop
+    ; nop
+    
+    ; TRN: host releases bus, target drives
+    set r30.t8
+    .loop 10
+    nop
+    .endloop
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+
+    ; Read 3-bit ACK (expecting 0b001 = 0x1)
+    ldi r11, 3
+ak:
+    set r30.t8
+    .loop 10
+    nop
+    .endloop
+    mov r6, r31
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+    sub r11, r11, 1
+    qbne ak, r11, 0
+
+    ; Read 32-bit IDCODE (sample but don't store)
+    ldi r11, 32
+dt:
+    set r30.t8
+    .loop 10
+    nop
+    .endloop
+    mov r7, r31
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+    sub r11, r11, 1
+    qbne dt, r11, 0
+
+    ; Read parity bit
+    set r30.t8
+    .loop 10
+    nop
+    .endloop
+    mov r8, r31
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+
+    ; TRN + 8 idle
+    set r30.t8
+    .loop 10
+    nop
+    .endloop
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+    clr r30.t9
+    ldi r2, 8
+idl:
+    set r30.t8
+    .loop 10
+    nop
+    .endloop
+    clr r30.t8
+    .loop 10
+    nop
+    .endloop
+    sub r2,r2,1
+    qbne idl,r2,0
+    set r30.t9
+
+    ldi32 r5, DELAY_100MS
+dly:
+    sub r5,r5,1
+    qbne dly,r5,0
+
+    qba rst
+    halt

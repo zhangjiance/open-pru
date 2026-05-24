@@ -1,0 +1,37 @@
+; SWD IDCODE: Test PRU writing PADCONFIG register - single write then halt
+    .retain
+    .retainrefs
+    .global main
+    .sect ".text"
+    .asg 0x08, KICK0_OFFSET
+    .asg 0x0C, KICK1_OFFSET
+    .asg 0x68EF3490, KICK0_UNLOCK
+    .asg 0xD172BC5A, KICK1_UNLOCK
+    .asg 0xBC, PADCFG_V24_OFFSET
+    .asg 0x00060006, MODE_PRU_GPI_PULLUP
+
+main:
+    ; Configure c28 to point to 0x00101000 (CTRL_MMR0_KICK base)
+    ; Configure c29 to point to 0x000F4000 (PADCFG registers)
+    ; c2x address = c2x_POINTER << 8
+    ldi32 r0, 0x00022028
+    ldi   r1.w0, 0x1010
+    ldi   r1.w2, 0x0F40
+    sbbo  &r1, r0, 0, 4
+    
+    ; Unlock PADCONFIG registers via c28
+    ldi32 r3, KICK0_UNLOCK
+    sbco  &r3, c28, KICK0_OFFSET, 4
+    ldi32 r3, KICK1_UNLOCK
+    sbco  &r3, c28, KICK1_OFFSET, 4
+    
+    ; Set V24 to RX mode (0x00060006) via c29
+    ldi32 r3, MODE_PRU_GPI_PULLUP
+    sbco  &r3, c29, PADCFG_V24_OFFSET, 4
+    
+    ; Read back to r5 for verification
+    lbco  &r5, c29, PADCFG_V24_OFFSET, 4
+    
+    ; Infinite loop (so Linux can read register value)
+loop_forever:
+    qba loop_forever
