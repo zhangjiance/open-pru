@@ -384,15 +384,18 @@ wr_clk:
     DELAY
     CLK_LO
 
-    ; Send bits 1-31
+    ; Send bits 1-31, compute XOR parity inline
     mov r26, r22
     lsr r26, r26, 1
     ldi r25, 31
+    and r0, r22, 1          ; parity acc = bit0 (pre-driven)
 wr_txloop:
-    and r0, r26, 1
+    mov r21, r26
+    and r21, r21, 1
+    xor r0, r0, r21          ; acc ^= current bit
     lsr r26, r26, 1
     CLK_LO
-    qbbs wr_txhi, r0, 0
+    qbbs wr_txhi, r21, 0
     DIO_LO
     qba wr_txset
 wr_txhi:
@@ -404,22 +407,13 @@ wr_txset:
     sub r25, r25, 1
     qbne wr_txloop, r25, 0
 
-    ; Parity
-    mov r26, r22
-    ldi r0, 0
-    ldi r25, 32
-wr_par:
-    and r21, r26, 1
-    xor r0, r0, r21
-    lsr r26, r26, 1
-    sub r25, r25, 1
-    qbne wr_par, r25, 0
+    ; Parity bit (r0 = XOR of all 32 data bits, inline-computed)
     CLK_LO
-    qbbs wr_phi, r0, 0     ; r0=1(data odd) → parity=1 → total=even
-    DIO_LO                 ; r0=0(data even) → parity=0 → total=even
+    qbbs wr_phi, r0, 0
+    DIO_LO
     qba wr_pdone
 wr_phi:
-    DIO_HI                 ; r0=1(data odd) → parity=1 → total=even
+    DIO_HI
 wr_pdone:
     DELAY
     CLK_HI
