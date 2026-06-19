@@ -3,11 +3,10 @@
 ;
 ; Link register convention:
 ;   r28.w0 — standard return for internal subroutines
-;   r29.w0 — used ONLY by DELAY macro (never for subroutine calls)
+;   r19    — clobbered by DELAY macro
 ;   r3.w2  — return for C-callable functions
 ;
-; DELAY clobbers ONLY r29.w0 (not r28.w0!) so subroutines
-; called via jal r28.w0 are safe.
+; DELAY clobbers r19 (not r28.w0) so subroutines called via jal r28.w0 are safe.
 
     .retain
     .retainrefs
@@ -49,18 +48,10 @@ DIO_HI  .macro
     set r30.t9
     .endm
 ; DELAY: inline to avoid jal/ret overhead (~5 cycles saved per call)
+; Clobbers r19. Uses r18 (set by swd_set_speed) as iteration count.
+; Total cycles = 2 + 2*r18 (r18 must be > 0).
 DELAY .macro
     mov r19, r18
-    qbeq $1?, r19, 0
-$2?:
-    sub r19, r19, 1
-    qbne $2?, r19, 0
-$1?:
-    .endm
-
-; Fixed delay for sbbo to PADCONFIG (~100ns on L3 bus). Uses 40 iterations.
-PDELAY .macro
-    ldi  r19, 15
     qbeq $1?, r19, 0
 $2?:
     sub r19, r19, 1
@@ -102,7 +93,6 @@ tx_setup:
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
-    PDELAY         ; wait for L3 write to complete
     jmp r28.w0
 
 ;========================================================================
@@ -112,12 +102,11 @@ rx_setup:
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_RX
     sbbo &r17, r16, 0, 4
-    PDELAY         ; wait for L3 write to complete
     jmp r28.w0
 
 ;========================================================================
 ; tx_bits — r26=data(LSB), r25=bit count. Called via jal r28.w0.
-; DELAY uses r29.w0 so r28.w0 is preserved.
+; DELAY clobbers r19 so r28.w0 is preserved.
 ;========================================================================
 tx_bits:
 txb_loop:
@@ -158,6 +147,7 @@ rxb_z:
 
 ;========================================================================
 ; turnaround_input — release DIO for target. Called via jal r28.w0.
+; Uses short fixed delays (~55ns+35ns) instead of DELAY to minimize TRN.
 ;========================================================================
 turnaround_input:
     CLK_LO
@@ -165,26 +155,37 @@ turnaround_input:
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_RX
     sbbo &r17, r16, 0, 4
-    PDELAY            ; fixed delay for L3 sbbo (~120 PRU cycles)
+    ldi r19, 5       ; short fixed delay for L3 write to settle (~55ns)
+ti_dly1:
+    sub r19, r19, 1
+    qbne ti_dly1, r19, 0
     CLK_HI            ; TRN bit
-    DELAY
+    ldi r19, 3       ; clock high (~35ns)
+ti_dly2:
+    sub r19, r19, 1
+    qbne ti_dly2, r19, 0
     CLK_LO
-    DELAY
     jmp r28.w0
 
 ;========================================================================
 ; turnaround_output — reclaim DIO. Called via jal r28.w0.
+; Uses short fixed delays (~55ns+35ns) instead of DELAY to minimize TRN.
 ;========================================================================
 turnaround_output:
     CLK_LO
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
-    PDELAY            ; fixed delay for L3 sbbo
+    ldi r19, 5       ; short fixed delay for L3 write to settle (~55ns)
+to_dly1:
+    sub r19, r19, 1
+    qbne to_dly1, r19, 0
     CLK_HI
-    DELAY
+    ldi r19, 3       ; clock high (~35ns)
+to_dly2:
+    sub r19, r19, 1
+    qbne to_dly2, r19, 0
     CLK_LO
-    DELAY
     jmp r28.w0
 
 ;========================================================================
@@ -343,11 +344,11 @@ swd_read_reg:
     sbbo &r21, r22, 0, 4     ; store to *data
 
     ; Read parity
-    ldi r24, 0
     DELAY
     CLK_HI
+    ldi r24, 0          ; default: parity=0
     qbbc rd_pdone, r31, 9
-    ldi r24, 1
+    ldi r24, 1          ; DIO high → parity=1
 rd_pdone:
     DELAY
     CLK_LO
@@ -377,14 +378,20 @@ swd_write_reg:
     jal r28.w0, rx_bits
     mov r20, r21
 
-    ; TRN cycle: switch to output mode
+    ; TRN cycle: switch to output mode (short fixed delays)
     CLK_LO
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
-    PDELAY         ; fixed delay for L3 sbbo
+    ldi r19, 5       ; short fixed delay for L3 write (~55ns)
+wr_trn1:
+    sub r19, r19, 1
+    qbne wr_trn1, r19, 0
     CLK_HI         ; TRN bit
-    DELAY
+    ldi r19, 3       ; clock high (~35ns)
+wr_trn2:
+    sub r19, r19, 1
+    qbne wr_trn2, r19, 0
     CLK_LO
 
     ; Pre-drive bit 0 — separate from TRN cycle
@@ -425,12 +432,10 @@ wr_txset:
 
     ; Parity bit (r0 = XOR of all 32 data bits, inline-computed)
     CLK_LO
-    qbbs wr_phi, r0, 0
-    DIO_LO
-    qba wr_pdone
+    DIO_HI              ; default to high
+    qbbs wr_phi, r0, 0  ; keep high if parity=1
+    DIO_LO              ; else set low (parity=0)
 wr_phi:
-    DIO_HI
-wr_pdone:
     DELAY
     CLK_HI
     DELAY
