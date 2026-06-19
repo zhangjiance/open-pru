@@ -19,5 +19,21 @@ include $(OPEN_PRU_PATH)/pru_rules.mak
 
 # Append include paths
 INCLUDE += --include_path=$(OPEN_PRU_PATH)/source/include
+INCLUDE += --include_path=$(OPEN_PRU_PATH)/source/include/linux
+INCLUDE += --include_path=.
 
-# No additional compiler flags needed for pure assembly
+# INTC CONFIGURATION
+HOST_INT_BIT = 30
+TO_ARM_HOST = 16
+FROM_ARM_HOST = 17
+
+# RPMSG CONFIGURATION
+CHAN_PORT = 30
+
+# Defines
+DFLAGS := \
+	-DCHAN_PORT=$(CHAN_PORT) -DHOST_INT_BIT=$(HOST_INT_BIT) \
+	-DTO_ARM_HOST=$(TO_ARM_HOST) -DFROM_ARM_HOST=$(FROM_ARM_HOST)
+
+# Libraries
+LIBS := --library=$(OPEN_PRU_PATH)/source/rpmsg/lib/rpmsg.lib
