@@ -28,9 +28,9 @@
     .asg 0x00060006, MODE_DIO_RX
     .asg 0x00060007, MODE_AB24_PU
 
-; 内联延时宏（SWD CLK）：1 个 nop，用于 SWD CLK 半周期
+; 延时宏（r18=次数, r28.w0 返）
 DELAY .macro
-    nop
+    jal r28.w0, delay
     .endm
 
 ; Pinmux 等待宏（固定延时，不受 SWD 频率影响）
@@ -71,6 +71,7 @@ swd_init:
 ; swd_read_idcode — 执行一次 SWD IDCODE 读取
 ;======================================================================
 swd_read_idcode:
+    ldi r18, 1
     ;========================================
     ; 切换 DIO 为 TX 模式，等待生效
     ;========================================
@@ -154,15 +155,12 @@ read_ack_loop:
     clr r30.t8
     sub r25, r25, 1
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
-
     qbbc ack_bit_zero, r31, 9
     or r20, r20, r23
 ack_bit_zero:
     lsl r23, r23, 1
+    DELAY
 
     qbne read_ack_loop, r25, 0
 
@@ -173,335 +171,269 @@ ack_bit_zero:
     ; bit 0
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id0, r31, 9
     or r21, r21, r23
 id0: lsl r23, r23, 1
+    DELAY
     ; bit 1
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id1, r31, 9
     or r21, r21, r23
 id1: lsl r23, r23, 1
+    DELAY
     ; bit 2
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id2, r31, 9
     or r21, r21, r23
 id2: lsl r23, r23, 1
+    DELAY
     ; bit 3
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id3, r31, 9
     or r21, r21, r23
 id3: lsl r23, r23, 1
+    DELAY
     ; bit 4
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id4, r31, 9
     or r21, r21, r23
 id4: lsl r23, r23, 1
+    DELAY
     ; bit 5
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id5, r31, 9
     or r21, r21, r23
 id5: lsl r23, r23, 1
+    DELAY
     ; bit 6
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id6, r31, 9
     or r21, r21, r23
 id6: lsl r23, r23, 1
+    DELAY
     ; bit 7
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id7, r31, 9
     or r21, r21, r23
 id7: lsl r23, r23, 1
+    DELAY
     ; bit 8
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id8, r31, 9
     or r21, r21, r23
 id8: lsl r23, r23, 1
+    DELAY
     ; bit 9
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id9, r31, 9
     or r21, r21, r23
 id9: lsl r23, r23, 1
+    DELAY
     ; bit 10
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id10, r31, 9
     or r21, r21, r23
 id10: lsl r23, r23, 1
+    DELAY
     ; bit 11
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id11, r31, 9
     or r21, r21, r23
 id11: lsl r23, r23, 1
+    DELAY
     ; bit 12
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id12, r31, 9
     or r21, r21, r23
 id12: lsl r23, r23, 1
+    DELAY
     ; bit 13
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id13, r31, 9
     or r21, r21, r23
 id13: lsl r23, r23, 1
+    DELAY
     ; bit 14
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id14, r31, 9
     or r21, r21, r23
 id14: lsl r23, r23, 1
+    DELAY
     ; bit 15
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id15, r31, 9
     or r21, r21, r23
 id15: lsl r23, r23, 1
+    DELAY
     ; bit 16
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id16, r31, 9
     or r21, r21, r23
 id16: lsl r23, r23, 1
+    DELAY
     ; bit 17
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id17, r31, 9
     or r21, r21, r23
 id17: lsl r23, r23, 1
+    DELAY
     ; bit 18
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id18, r31, 9
     or r21, r21, r23
 id18: lsl r23, r23, 1
+    DELAY
     ; bit 19
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id19, r31, 9
     or r21, r21, r23
 id19: lsl r23, r23, 1
+    DELAY
     ; bit 20
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id20, r31, 9
     or r21, r21, r23
 id20: lsl r23, r23, 1
+    DELAY
     ; bit 21
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id21, r31, 9
     or r21, r21, r23
 id21: lsl r23, r23, 1
+    DELAY
     ; bit 22
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id22, r31, 9
     or r21, r21, r23
 id22: lsl r23, r23, 1
+    DELAY
     ; bit 23
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id23, r31, 9
     or r21, r21, r23
 id23: lsl r23, r23, 1
+    DELAY
     ; bit 24
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id24, r31, 9
     or r21, r21, r23
 id24: lsl r23, r23, 1
+    DELAY
     ; bit 25
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id25, r31, 9
     or r21, r21, r23
 id25: lsl r23, r23, 1
+    DELAY
     ; bit 26
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id26, r31, 9
     or r21, r21, r23
 id26: lsl r23, r23, 1
+    DELAY
     ; bit 27
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id27, r31, 9
     or r21, r21, r23
 id27: lsl r23, r23, 1
+    DELAY
     ; bit 28
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id28, r31, 9
     or r21, r21, r23
 id28: lsl r23, r23, 1
+    DELAY
     ; bit 29
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id29, r31, 9
     or r21, r21, r23
 id29: lsl r23, r23, 1
+    DELAY
     ; bit 30
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id30, r31, 9
     or r21, r21, r23
 id30: lsl r23, r23, 1
+    DELAY
     ; bit 31
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     qbbc id31, r31, 9
     or r21, r21, r23
 id31: lsl r23, r23, 1
+    DELAY
     ;========================================
     ; 读取校验位（1 bit）→ R24
     ;========================================
     clr r30.t8
     DELAY
-    nop
-    nop
     set r30.t8
-    DELAY
     ldi r24, 0
     qbbc parity_done, r31, 9
     ldi r24, 1
+    DELAY
 parity_done:
 
     ;========================================
@@ -512,3 +444,13 @@ parity_done:
     sbbo &r24, r14, 8, 4
 
     jmp r3.w2
+
+; 延时子程序（r18=次数, r19=临时, r28.w0=返回）
+delay:
+    qbeq dret, r18, 0   ; r18=0 则直接返回
+    mov r19, r18
+dloop:
+    sub r19, r19, 1
+    qbne dloop, r19, 0
+dret:
+    jmp r28.w0
