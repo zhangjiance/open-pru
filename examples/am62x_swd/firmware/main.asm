@@ -31,7 +31,8 @@ CMD_J2S   .set 4   ; JTAG-to-SWD
 CMD_IDLE  .set 5
 CMD_ABORT .set 6
 CMD_CONNECT .set 7
-CMD_BATCH  .set 8   ; batch: process N sub-commands from seq_buf
+CMD_BATCH  .set 8   ; batch: N mixed sub-commands from seq_buf
+CMD_BRD    .set 9   ; batch read: N AP DRW reads, results in seq_buf
 
 MB_RDBUFF .set 36  ; cached RDBUFF after AP read
 MB_FLAGS  .set 40  ; bit0=has cached RDBUFF
@@ -72,7 +73,36 @@ poll:
     qbeq do_abort, r24, CMD_ABORT
     qbeq do_connect, r24, CMD_CONNECT
     qbeq do_batch, r24, CMD_BATCH
+    qbeq do_brd, r24, CMD_BRD
     qba finish
+
+; ---- Batch read: r25=count. N AP DRW reads → seq_buf. Max ~47 words ----
+do_brd:
+    ldi32 r2, 0x1044         ; seq_buf
+    mov  r6, r25             ; count
+    ldi32 r5, 0x1100         ; scratch
+    qbeq brd_done, r6, 0
+brd_lp:
+    ldi  r14, 0x9F           ; AP DRW read cmd (reload each iter—swd_read_reg clobbers r14)
+    mov  r15, r5
+    jal  r3.w2, swd_read_reg
+    lbbo &r0, r5, 0, 4        ; data
+    sbbo &r0, r2, 0, 4        ; store
+    add  r2, r2, 4
+    sub  r6, r6, 1
+    qbne brd_lp, r6, 0
+    ; Auto-cache RDBUFF after last read
+    ldi  r14, 0xBD           ; DP RDBUFF read
+    mov  r15, r5
+    jal  r3.w2, swd_read_reg
+    lbbo &r0, r5, 0, 4
+    sbbo &r0, r4, MB_RDBUFF, 4
+    ldi  r0, 1
+    sbbo &r0, r4, MB_FLAGS, 4
+brd_done:
+    ldi  r21, 1
+    ldi  r27, 0
+    qba  finish
 
 ; ---- Batch: process r25 sub-commands from seq_buf (each 3 words) ----
 do_batch:
