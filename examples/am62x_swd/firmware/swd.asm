@@ -48,9 +48,24 @@ DIO_LO  .macro
 DIO_HI  .macro
     set r30.t9
     .endm
-; DELAY uses r29.w0 as link (NOT r28.w0!) so subroutines called via r28.w0 are safe
+; DELAY: inline to avoid jal/ret overhead (~5 cycles saved per call)
 DELAY .macro
-    jal r29.w0, delay_fn
+    mov r19, r18
+    qbeq $1?, r19, 0
+$2?:
+    sub r19, r19, 1
+    qbne $2?, r19, 0
+$1?:
+    .endm
+
+; Fixed delay for sbbo to PADCONFIG (~100ns on L3 bus). Uses 40 iterations.
+PDELAY .macro
+    ldi  r19, 15
+    qbeq $1?, r19, 0
+$2?:
+    sub r19, r19, 1
+    qbne $2?, r19, 0
+$1?:
     .endm
 
 ;========================================================================
@@ -87,6 +102,7 @@ tx_setup:
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
+    PDELAY         ; wait for L3 write to complete
     jmp r28.w0
 
 ;========================================================================
@@ -96,6 +112,7 @@ rx_setup:
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_RX
     sbbo &r17, r16, 0, 4
+    PDELAY         ; wait for L3 write to complete
     jmp r28.w0
 
 ;========================================================================
@@ -144,15 +161,14 @@ rxb_z:
 ;========================================================================
 turnaround_input:
     CLK_LO
-    DIO_LO
-    DELAY
+    DIO_LO           ; release DIO
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_RX
     sbbo &r17, r16, 0, 4
-    DELAY          ; wait for pinmux switch to input mode!
-    CLK_HI         ; TRN bit — target sees rising edge, takes control
+    PDELAY            ; fixed delay for L3 sbbo (~120 PRU cycles)
+    CLK_HI            ; TRN bit
     DELAY
-    CLK_LO         ; prepare for rx: CLK must be low before sampling
+    CLK_LO
     DELAY
     jmp r28.w0
 
@@ -164,7 +180,7 @@ turnaround_output:
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
-    DELAY         ; wait for pinmux switch to take effect!
+    PDELAY            ; fixed delay for L3 sbbo
     CLK_HI
     DELAY
     CLK_LO
@@ -366,7 +382,7 @@ swd_write_reg:
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
-    DELAY         ; wait for pinmux switch to OUTPUT mode
+    PDELAY         ; fixed delay for L3 sbbo
     CLK_HI         ; TRN bit
     DELAY
     CLK_LO
@@ -443,15 +459,5 @@ d2s_data:
     .byte 0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0x00
 
 ;========================================================================
-; delay_fn — r18 = count. Uses r29.w0 as link (set by DELAY macro)
+; delay_fn removed — DELAY is now an inline macro
 ;========================================================================
-    .sect ".text:delay"
-    .clink
-delay_fn:
-    qbeq ddret, r18, 0
-    mov r19, r18
-ddloop:
-    sub r19, r19, 1
-    qbne ddloop, r19, 0
-ddret:
-    jmp r29.w0

@@ -31,6 +31,7 @@ CMD_J2S   .set 4   ; JTAG-to-SWD
 CMD_IDLE  .set 5
 CMD_ABORT .set 6
 CMD_CONNECT .set 7
+CMD_BATCH  .set 8   ; batch: process N sub-commands from seq_buf
 
 MB_RDBUFF .set 36  ; cached RDBUFF after AP read
 MB_FLAGS  .set 40  ; bit0=has cached RDBUFF
@@ -70,7 +71,52 @@ poll:
     qbeq do_idle, r24, CMD_IDLE
     qbeq do_abort, r24, CMD_ABORT
     qbeq do_connect, r24, CMD_CONNECT
+    qbeq do_batch, r24, CMD_BATCH
     qba finish
+
+; ---- Batch: process r25 sub-commands from seq_buf (each 3 words) ----
+do_batch:
+    ldi32 r2, 0x1044         ; seq_buf at MB+68
+    mov  r6, r25             ; count (r6 safe from jal r3.w2)
+    ldi32 r5, 0x1100         ; scratch for read data
+    qbeq batch_done, r6, 0
+batch_lp:
+    lbbo &r24, r2, 0, 4      ; sub-cmd type
+    lbbo &r25, r2, 4, 4      ; arg1 (SWD cmd byte or idle count)
+    lbbo &r26, r2, 8, 4      ; arg2 (write data)
+    ldi  r21, 1
+    ldi  r27, 0
+    qbeq batch_rd, r24, 1    ; CMD_SWD_READ
+    qbeq batch_wr, r24, 2    ; CMD_SWD_WRITE
+    qbeq batch_idle, r24, 5  ; CMD_IDLE
+    qba  batch_next
+batch_rd:
+    mov  r14, r25
+    mov  r15, r5
+    jal  r3.w2, swd_read_reg
+    mov  r21, r14
+    lbbo &r27, r5, 0, 4
+    qba  batch_next
+batch_wr:
+    mov  r14, r25
+    mov  r15, r26
+    jal  r3.w2, swd_write_reg
+    mov  r21, r14
+    qba  batch_next
+batch_idle:
+    mov  r14, r25
+    jal  r3.w2, swd_idle_cycles
+    qba  batch_next
+batch_next:
+    sbbo &r27, r2, 0, 4      ; rdata
+    sbbo &r21, r2, 4, 4      ; ack
+    add  r2, r2, 12
+    sub  r6, r6, 1
+    qbne batch_lp, r6, 0
+batch_done:
+    ldi  r21, 1
+    ldi  r27, 0
+    qba  finish
 
 do_read:
     ; r25 = SWD cmd byte (START|PARK already set)
