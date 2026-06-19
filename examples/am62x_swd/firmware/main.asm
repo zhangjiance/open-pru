@@ -32,6 +32,9 @@ CMD_IDLE  .set 5
 CMD_ABORT .set 6
 CMD_CONNECT .set 7
 
+MB_RDBUFF .set 36  ; cached RDBUFF after AP read
+MB_FLAGS  .set 40  ; bit0=has cached RDBUFF
+
 main:
     ldi32 r4, MB
 
@@ -76,6 +79,19 @@ do_read:
     jal  r3.w2, swd_read_reg  ; ack in r14, data at [r15]
     mov  r21, r14
     lbbo &r27, r15, 0, 4
+
+    ; Auto-cache RDBUFF after AP reads (saves one mailbox round-trip)
+    mov  r0, r25
+    and  r0, r0, 2           ; test APnDP bit
+    qbeq rd_done, r0, 0
+    ldi  r14, 0xBD           ; DP RDBUFF read cmd: START|RnW|PARK|A32(reg12)|parity
+    ldi32 r15, 0x1104
+    jal  r3.w2, swd_read_reg
+    lbbo &r0, r15, 0, 4
+    sbbo &r0, r4, MB_RDBUFF, 4
+    ldi  r0, 1
+    sbbo &r0, r4, MB_FLAGS, 4
+rd_done:
     qba finish
 
 do_write:
