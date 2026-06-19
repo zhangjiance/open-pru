@@ -5,6 +5,7 @@ include $(OPEN_PRU_PATH)/imports.mak
 OUTPUT_NAME := am62x_swd_pruss0_pru0_fw
 
 # Source file directories
+# main.asm, swd.asm, rsc.c are in firmware/ (../../.. from this makefile)
 FILES_PATH := .. ../../.. .
 
 # Linker command file
@@ -20,20 +21,18 @@ include $(OPEN_PRU_PATH)/pru_rules.mak
 # Append include paths
 INCLUDE += --include_path=$(OPEN_PRU_PATH)/source/include
 INCLUDE += --include_path=$(OPEN_PRU_PATH)/source/include/linux
+INCLUDE += --include_path=..
 INCLUDE += --include_path=.
 
-# INTC CONFIGURATION
+# RPMsg defines required by resource_table.h (firmware doesn't call RPMsg APIs)
 HOST_INT_BIT = 30
 TO_ARM_HOST = 16
 FROM_ARM_HOST = 17
-
-# RPMSG CONFIGURATION
 CHAN_PORT = 30
 
-# Defines
 DFLAGS := \
 	-DCHAN_PORT=$(CHAN_PORT) -DHOST_INT_BIT=$(HOST_INT_BIT) \
 	-DTO_ARM_HOST=$(TO_ARM_HOST) -DFROM_ARM_HOST=$(FROM_ARM_HOST)
 
-# Libraries
-LIBS := --library=$(OPEN_PRU_PATH)/source/rpmsg/lib/rpmsg.lib
+# No RPMSG library needed (firmware doesn't call RPMsg APIs)
+LIBS :=

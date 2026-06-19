@@ -1,456 +1,463 @@
-; swd.asm - SWD IDCODE 读取汇编函数（C 可调用）
-; CLK: R30.8 (U22) - PADCONFIG46 @ 0x000F40B8
-; DIO: R30.9/R31.9 (V24) - PADCONFIG47 @ 0x000F40BC
+; swd.asm — SWD protocol functions
+; CLK: R30.8 (U22), DIO: R30.9/R31.9 (V24)
 ;
-; 函数:
-;   void swd_init(void)     — 一次性 pinmux 初始化，仅调用一次
-;   void swd_read_idcode(volatile uint32_t *result)
-;      参数: R14 = 指向 result[3] 的指针
-;      result[0] = ACK, result[1] = IDCODE, result[2] = Parity
+; Link register convention:
+;   r28.w0 — standard return for internal subroutines
+;   r29.w0 — used ONLY by DELAY macro (never for subroutine calls)
+;   r3.w2  — return for C-callable functions
+;
+; DELAY clobbers ONLY r29.w0 (not r28.w0!) so subroutines
+; called via jal r28.w0 are safe.
 
     .retain
     .retainrefs
     .sect ".text:swd"
     .clink
-    .global swd_init
-    .global swd_read_idcode
+    .global swd_init, swd_set_speed
+    .global swd_line_reset, swd_idle_cycles
+    .global swd_jtag_to_swd, swd_swd_to_jtag
+    .global swd_swd_to_dormant, swd_dormant_to_swd
+    .global swd_read_reg, swd_write_reg
+    .global swd_custom_seq
 
-; Pinmux 控制常量
-    .asg 0x00101008, KICK0_ADDR
-    .asg 0x0010100C, KICK1_ADDR
-    .asg 0x68EF3490, KICK0_UNLOCK
-    .asg 0xD172BC5A, KICK1_UNLOCK
-    .asg 0x000F40B8, PADCFG_CLK_ADDR
-    .asg 0x000F40BC, PADCFG_DIO_ADDR
-    .asg 0x000F40F8, PADCFG_AB24_ADDR
-    .asg 0x00050005, MODE_CLK_OUT
-    .asg 0x00050005, MODE_DIO_OUT
-    .asg 0x00060006, MODE_DIO_RX
-    .asg 0x00060007, MODE_AB24_PU
+;========================================================================
+; Constants
+;========================================================================
+KICK0_ADDR     .set 0x00101008
+KICK1_ADDR     .set 0x0010100C
+KICK0_UNLOCK   .set 0x68EF3490
+KICK1_UNLOCK   .set 0xD172BC5A
+PADCFG_CLK     .set 0x000F40B8
+PADCFG_DIO     .set 0x000F40BC
+MODE_CLK_OUT   .set 0x00050005
+MODE_DIO_OUT   .set 0x00050005
+MODE_DIO_RX    .set 0x00070006   ; pull-up enabled (bit 16), input enabled (bit 18)
 
-; 延时宏（r18=次数, r28.w0 返）
+;========================================================================
+; Macros
+;========================================================================
+CLK_LO  .macro
+    clr r30.t8
+    .endm
+CLK_HI  .macro
+    set r30.t8
+    .endm
+DIO_LO  .macro
+    clr r30.t9
+    .endm
+DIO_HI  .macro
+    set r30.t9
+    .endm
+; DELAY uses r29.w0 as link (NOT r28.w0!) so subroutines called via r28.w0 are safe
 DELAY .macro
-    jal r28.w0, delay
+    jal r29.w0, delay_fn
     .endm
 
-; Pinmux 等待宏（固定延时，不受 SWD 频率影响）
-PDELAY .macro
-    nop
-    .endm
-
-;======================================================================
-; swd_init — 一次性 pinmux 配置（解锁 MMR 并设置 CLK/AB24/DIO 引脚）
-;======================================================================
+;========================================================================
+; swd_init
+;========================================================================
 swd_init:
-    ; 解锁 MMR（只需一次）
     ldi32 r16, KICK0_ADDR
     ldi32 r17, KICK0_UNLOCK
     sbbo &r17, r16, 0, 4
     ldi32 r16, KICK1_ADDR
     ldi32 r17, KICK1_UNLOCK
     sbbo &r17, r16, 0, 4
-
-    ; CLK 引脚为输出
-    ldi32 r16, PADCFG_CLK_ADDR
+    ldi32 r16, PADCFG_CLK
     ldi32 r17, MODE_CLK_OUT
     sbbo &r17, r16, 0, 4
-
-    ; AB24 为输入上拉
-    ldi32 r16, PADCFG_AB24_ADDR
-    ldi32 r17, MODE_AB24_PU
-    sbbo &r17, r16, 0, 4
-
-    ; DIO 初始为输出
-    ldi32 r16, PADCFG_DIO_ADDR
+    ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
-
+    CLK_LO
+    DIO_LO
     jmp r3.w2
 
-;======================================================================
-; swd_read_idcode — 执行一次 SWD IDCODE 读取
-;======================================================================
-swd_read_idcode:
-    ldi r18, 1
-    ;========================================
-    ; 切换 DIO 为 TX 模式，等待生效
-    ;========================================
-    ldi32 r16, PADCFG_DIO_ADDR
+;========================================================================
+; swd_set_speed — r14 = delay cycles
+;========================================================================
+swd_set_speed:
+    mov r18, r14
+    jmp r3.w2
+
+;========================================================================
+; tx_setup — DIO to output mode. Called via jal r28.w0
+;========================================================================
+tx_setup:
+    ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
+    jmp r28.w0
 
-    ;========================================
-    ; Line Reset：55 个 CLK 周期，DIO=1
-    ;========================================
-    set r30.t9
-    ldi r25, 55
-reset_loop:
-    clr r30.t8
-    DELAY
-    set r30.t8
-    DELAY
-    sub r25, r25, 1
-    qbne reset_loop, r25, 0
-
-    ;========================================
-    ; 空闲周期：2 个 CLK 周期，DIO=0
-    ;========================================
-    clr r30.t9
-    ldi r25, 2
-idle_loop:
-    clr r30.t8
-    DELAY
-    set r30.t8
-    DELAY
-    sub r25, r25, 1
-    qbne idle_loop, r25, 0
-
-    ;========================================
-    ; 发送 SWD 命令：0xA5（LSB first）
-    ;========================================
-    ldi r26, 0xA5
-    ldi r25, 8
-
-send_cmd_loop:
-    and r27, r26, 1
-    lsr r26, r26, 1
-
-    clr r30.t8
-    qbbs set_dio_high, r27, 0
-    clr r30.t9
-    qba dio_set
-set_dio_high:
-    set r30.t9
-dio_set:
-    DELAY
-
-    set r30.t8
-    DELAY
-
-    sub r25, r25, 1
-    qbne send_cmd_loop, r25, 0
-
-    ;========================================
-    ; TRN 转向周期：释放 DIO，切换到 RX（MMR 已解锁）
-    ;========================================
-    clr r30.t8
-    clr r30.t9
-    DELAY
-
-    ldi32 r16, PADCFG_DIO_ADDR
+;========================================================================
+; rx_setup — DIO to input+pullup. Called via jal r28.w0
+;========================================================================
+rx_setup:
+    ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_RX
     sbbo &r17, r16, 0, 4
+    jmp r28.w0
 
-    set r30.t8
+;========================================================================
+; tx_bits — r26=data(LSB), r25=bit count. Called via jal r28.w0.
+; DELAY uses r29.w0 so r28.w0 is preserved.
+;========================================================================
+tx_bits:
+txb_loop:
+    and r0, r26, 1
+    lsr r26, r26, 1
+    CLK_LO
+    qbbs txb_hi, r0, 0
+    DIO_LO
+    qba txb_done
+txb_hi:
+    DIO_HI
+txb_done:
     DELAY
-
-    ;========================================
-    ; 读取 ACK（3 bit）→ R20
-    ;========================================
-    ldi r20, 0
-    ldi r25, 3
-    ldi r23, 1
-
-read_ack_loop:
-    clr r30.t8
+    CLK_HI
+    DELAY
     sub r25, r25, 1
-    DELAY
-    set r30.t8
-    qbbc ack_bit_zero, r31, 9
-    or r20, r20, r23
-ack_bit_zero:
+    qbne txb_loop, r25, 0
+    CLK_LO
+    jmp r28.w0
+
+;========================================================================
+; rx_bits — r21=accumulator, r23=mask, r25=count. Called via jal r28.w0.
+;========================================================================
+rx_bits:
+    CLK_LO         ; ensure CLK starts low before first bit
+rxb_loop:
+    sub r25, r25, 1
+    DELAY          ; DIO setup time (target drives data)
+    CLK_HI         ; rising edge — host samples DIO
+    qbbc rxb_z, r31, 9
+    or r21, r21, r23
+rxb_z:
     lsl r23, r23, 1
-    DELAY
+    DELAY          ; hold time
+    CLK_LO         ; falling edge — prepare for next bit
+    qbne rxb_loop, r25, 0
+    jmp r28.w0
 
-    qbne read_ack_loop, r25, 0
+;========================================================================
+; turnaround_input — release DIO for target. Called via jal r28.w0.
+;========================================================================
+turnaround_input:
+    CLK_LO
+    DIO_LO
+    DELAY
+    ldi32 r16, PADCFG_DIO
+    ldi32 r17, MODE_DIO_RX
+    sbbo &r17, r16, 0, 4
+    DELAY          ; wait for pinmux switch to input mode!
+    CLK_HI         ; TRN bit — target sees rising edge, takes control
+    DELAY
+    CLK_LO         ; prepare for rx: CLK must be low before sampling
+    DELAY
+    jmp r28.w0
 
-    ;========================================
-    ; 读取 IDCODE（32 bit）→ R21
-    ldi r21, 0
-    ldi r23, 1
-    ; bit 0
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id0, r31, 9
-    or r21, r21, r23
-id0: lsl r23, r23, 1
-    DELAY
-    ; bit 1
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id1, r31, 9
-    or r21, r21, r23
-id1: lsl r23, r23, 1
-    DELAY
-    ; bit 2
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id2, r31, 9
-    or r21, r21, r23
-id2: lsl r23, r23, 1
-    DELAY
-    ; bit 3
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id3, r31, 9
-    or r21, r21, r23
-id3: lsl r23, r23, 1
-    DELAY
-    ; bit 4
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id4, r31, 9
-    or r21, r21, r23
-id4: lsl r23, r23, 1
-    DELAY
-    ; bit 5
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id5, r31, 9
-    or r21, r21, r23
-id5: lsl r23, r23, 1
-    DELAY
-    ; bit 6
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id6, r31, 9
-    or r21, r21, r23
-id6: lsl r23, r23, 1
-    DELAY
-    ; bit 7
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id7, r31, 9
-    or r21, r21, r23
-id7: lsl r23, r23, 1
-    DELAY
-    ; bit 8
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id8, r31, 9
-    or r21, r21, r23
-id8: lsl r23, r23, 1
-    DELAY
-    ; bit 9
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id9, r31, 9
-    or r21, r21, r23
-id9: lsl r23, r23, 1
-    DELAY
-    ; bit 10
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id10, r31, 9
-    or r21, r21, r23
-id10: lsl r23, r23, 1
-    DELAY
-    ; bit 11
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id11, r31, 9
-    or r21, r21, r23
-id11: lsl r23, r23, 1
-    DELAY
-    ; bit 12
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id12, r31, 9
-    or r21, r21, r23
-id12: lsl r23, r23, 1
-    DELAY
-    ; bit 13
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id13, r31, 9
-    or r21, r21, r23
-id13: lsl r23, r23, 1
-    DELAY
-    ; bit 14
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id14, r31, 9
-    or r21, r21, r23
-id14: lsl r23, r23, 1
-    DELAY
-    ; bit 15
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id15, r31, 9
-    or r21, r21, r23
-id15: lsl r23, r23, 1
-    DELAY
-    ; bit 16
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id16, r31, 9
-    or r21, r21, r23
-id16: lsl r23, r23, 1
-    DELAY
-    ; bit 17
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id17, r31, 9
-    or r21, r21, r23
-id17: lsl r23, r23, 1
-    DELAY
-    ; bit 18
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id18, r31, 9
-    or r21, r21, r23
-id18: lsl r23, r23, 1
-    DELAY
-    ; bit 19
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id19, r31, 9
-    or r21, r21, r23
-id19: lsl r23, r23, 1
-    DELAY
-    ; bit 20
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id20, r31, 9
-    or r21, r21, r23
-id20: lsl r23, r23, 1
-    DELAY
-    ; bit 21
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id21, r31, 9
-    or r21, r21, r23
-id21: lsl r23, r23, 1
-    DELAY
-    ; bit 22
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id22, r31, 9
-    or r21, r21, r23
-id22: lsl r23, r23, 1
-    DELAY
-    ; bit 23
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id23, r31, 9
-    or r21, r21, r23
-id23: lsl r23, r23, 1
-    DELAY
-    ; bit 24
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id24, r31, 9
-    or r21, r21, r23
-id24: lsl r23, r23, 1
-    DELAY
-    ; bit 25
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id25, r31, 9
-    or r21, r21, r23
-id25: lsl r23, r23, 1
-    DELAY
-    ; bit 26
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id26, r31, 9
-    or r21, r21, r23
-id26: lsl r23, r23, 1
-    DELAY
-    ; bit 27
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id27, r31, 9
-    or r21, r21, r23
-id27: lsl r23, r23, 1
-    DELAY
-    ; bit 28
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id28, r31, 9
-    or r21, r21, r23
-id28: lsl r23, r23, 1
-    DELAY
-    ; bit 29
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id29, r31, 9
-    or r21, r21, r23
-id29: lsl r23, r23, 1
-    DELAY
-    ; bit 30
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id30, r31, 9
-    or r21, r21, r23
-id30: lsl r23, r23, 1
-    DELAY
-    ; bit 31
-    clr r30.t8
-    DELAY
-    set r30.t8
-    qbbc id31, r31, 9
-    or r21, r21, r23
-id31: lsl r23, r23, 1
-    DELAY
-    ;========================================
-    ; 读取校验位（1 bit）→ R24
-    ;========================================
-    clr r30.t8
-    DELAY
-    set r30.t8
-    ldi r24, 0
-    qbbc parity_done, r31, 9
-    ldi r24, 1
-    DELAY
-parity_done:
+;========================================================================
+; turnaround_output — reclaim DIO. Called via jal r28.w0.
+;========================================================================
+turnaround_output:
+    CLK_LO
+    ldi32 r16, PADCFG_DIO
+    ldi32 r17, MODE_DIO_OUT
+    sbbo &r17, r16, 0, 4
+    DELAY         ; wait for pinmux switch to take effect!
+    CLK_HI
+    DELAY
+    CLK_LO
+    DELAY
+    jmp r28.w0
 
-    ;========================================
-    ; 写入结果
-    ;========================================
-    sbbo &r20, r14, 0, 4
-    sbbo &r21, r14, 4, 4
-    sbbo &r24, r14, 8, 4
-
+;========================================================================
+; swd_line_reset
+;========================================================================
+swd_line_reset:
+    jal r28.w0, tx_setup
+    DIO_HI
+    ldi r25, 55
+lr_loop:
+    CLK_LO
+    DELAY
+    CLK_HI
+    DELAY
+    sub r25, r25, 1
+    qbne lr_loop, r25, 0
+    DIO_LO
+    ldi r25, 2
+idle2:
+    CLK_LO
+    DELAY
+    CLK_HI
+    DELAY
+    sub r25, r25, 1
+    qbne idle2, r25, 0
+    CLK_LO
     jmp r3.w2
 
-; 延时子程序（r18=次数, r19=临时, r28.w0=返回）
-delay:
-    qbeq dret, r18, 0   ; r18=0 则直接返回
-    mov r19, r18
-dloop:
-    sub r19, r19, 1
-    qbne dloop, r19, 0
-dret:
+;========================================================================
+; swd_idle_cycles — r14 = count
+;========================================================================
+swd_idle_cycles:
+    jal r28.w0, tx_setup
+    DIO_LO
+    mov r25, r14
+    qbeq ic_done, r25, 0
+ic_loop:
+    CLK_LO
+    DELAY
+    CLK_HI
+    DELAY
+    sub r25, r25, 1
+    qbne ic_loop, r25, 0
+ic_done:
+    CLK_LO
+    jmp r3.w2
+
+;========================================================================
+; send_byte_seq — r14=byte ptr, r15=byte count. Called via jal r28.w0.
+;========================================================================
+send_byte_seq:
+    mov r24, r28.w0          ; save link (will be clobbered by sub-calls)
+    jal r28.w0, tx_setup
+    mov r25, r15
+    qbeq sbs_done, r25, 0
+sbs_loop:
+    lbbo &r26, r14, 0, 1
+    add r14, r14, 1
+    ldi r25, 8
+    jal r28.w0, tx_bits
+    sub r15, r15, 1
+    mov r25, r15
+    qbne sbs_loop, r25, 0
+sbs_done:
+    CLK_LO
+    mov r28.w0, r24          ; restore link
     jmp r28.w0
+
+;========================================================================
+; swd_jtag_to_swd (136 bits), swd_swd_to_jtag (80), etc.
+;========================================================================
+swd_jtag_to_swd:
+    ldi32 r14, j2s_data
+    ldi r15, 17
+    jal r28.w0, send_byte_seq
+    jmp r3.w2
+
+swd_swd_to_jtag:
+    ldi32 r14, s2j_data
+    ldi r15, 10
+    jal r28.w0, send_byte_seq
+    jmp r3.w2
+
+swd_swd_to_dormant:
+    ldi32 r14, s2d_data
+    ldi r15, 9
+    jal r28.w0, send_byte_seq
+    jmp r3.w2
+
+swd_dormant_to_swd:
+    ldi32 r14, d2s_data
+    ldi r15, 28
+    jal r28.w0, send_byte_seq
+    jmp r3.w2
+
+;========================================================================
+; swd_custom_seq — r14=bytes, r15=bit count
+;========================================================================
+swd_custom_seq:
+    jal r28.w0, tx_setup
+    mov r25, r15
+    qbeq cs_done, r25, 0
+    lbbo &r26, r14, 0, 1
+cs_loop:
+    and r0, r26, 1
+    lsr r26, r26, 1
+    CLK_LO
+    qbbs cs_hi, r0, 0
+    DIO_LO
+    qba cs_set
+cs_hi:
+    DIO_HI
+cs_set:
+    DELAY
+    CLK_HI
+    DELAY
+    sub r25, r25, 1
+    qbeq cs_done, r25, 0
+    mov r0, r25
+    and r0, r0, 7
+    qbne cs_loop, r0, 0
+    add r14, r14, 1
+    lbbo &r26, r14, 0, 1
+    qba cs_loop
+cs_done:
+    CLK_LO
+    DIO_LO
+    jmp r3.w2
+
+;========================================================================
+; swd_read_reg — r14=SWD cmd byte (START|PARK preset), r15=data ptr
+; Returns: r14 = ACK (1=OK, 2=WAIT, 4=FAULT)
+;========================================================================
+swd_read_reg:
+    mov r22, r15             ; save data pointer
+
+    jal r28.w0, tx_setup
+    mov r26, r14
+    ldi r25, 8
+    jal r28.w0, tx_bits       ; send 8-bit command
+
+    jal r28.w0, turnaround_input
+
+    ; Read 3-bit ACK
+    ldi r21, 0
+    ldi r23, 1
+    ldi r25, 3
+    jal r28.w0, rx_bits
+    mov r20, r21              ; r20 = ACK
+
+    ; Read 32-bit data
+    ldi r21, 0
+    ldi r23, 1
+    ldi r25, 32
+    jal r28.w0, rx_bits
+    sbbo &r21, r22, 0, 4     ; store to *data
+
+    ; Read parity
+    ldi r24, 0
+    DELAY
+    CLK_HI
+    qbbc rd_pdone, r31, 9
+    ldi r24, 1
+rd_pdone:
+    DELAY
+    CLK_LO
+
+    jal r28.w0, turnaround_output
+    mov r14, r20
+    jmp r3.w2
+
+;========================================================================
+; swd_write_reg — r14=SWD cmd byte, r15=value
+; Returns: r14 = ACK
+;========================================================================
+swd_write_reg:
+    mov r22, r15             ; save write value
+
+    jal r28.w0, tx_setup
+    mov r26, r14
+    ldi r25, 8
+    jal r28.w0, tx_bits
+
+    jal r28.w0, turnaround_input
+
+    ; Read ACK
+    ldi r21, 0
+    ldi r23, 1
+    ldi r25, 3
+    jal r28.w0, rx_bits
+    mov r20, r21
+
+    ; TRN cycle: switch to output mode
+    CLK_LO
+    ldi32 r16, PADCFG_DIO
+    ldi32 r17, MODE_DIO_OUT
+    sbbo &r17, r16, 0, 4
+    DELAY         ; wait for pinmux switch to OUTPUT mode
+    CLK_HI         ; TRN bit
+    DELAY
+    CLK_LO
+
+    ; Pre-drive bit 0 — separate from TRN cycle
+    and r0, r22, 1
+    qbbs wr_hi, r0, 0
+    DIO_LO
+    qba wr_clk
+wr_hi:
+    DIO_HI
+wr_clk:
+    DELAY          ; setup
+    CLK_HI          ; target samples bit 0
+    DELAY
+    CLK_LO
+
+    ; Send bits 1-31
+    mov r26, r22
+    lsr r26, r26, 1
+    ldi r25, 31
+wr_txloop:
+    and r0, r26, 1
+    lsr r26, r26, 1
+    CLK_LO
+    qbbs wr_txhi, r0, 0
+    DIO_LO
+    qba wr_txset
+wr_txhi:
+    DIO_HI
+wr_txset:
+    DELAY
+    CLK_HI
+    DELAY
+    sub r25, r25, 1
+    qbne wr_txloop, r25, 0
+
+    ; Parity
+    mov r26, r22
+    ldi r0, 0
+    ldi r25, 32
+wr_par:
+    and r21, r26, 1
+    xor r0, r0, r21
+    lsr r26, r26, 1
+    sub r25, r25, 1
+    qbne wr_par, r25, 0
+    CLK_LO
+    qbbs wr_phi, r0, 0     ; r0=1(data odd) → parity=1 → total=even
+    DIO_LO                 ; r0=0(data even) → parity=0 → total=even
+    qba wr_pdone
+wr_phi:
+    DIO_HI                 ; r0=1(data odd) → parity=1 → total=even
+wr_pdone:
+    DELAY
+    CLK_HI
+    DELAY
+    CLK_LO
+
+    mov r14, r20
+    jmp r3.w2
+
+;========================================================================
+; Sequence data
+;========================================================================
+    .sect ".rodata"
+    .clink
+j2s_data:
+    .byte 0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0x9e,0xe7
+    .byte 0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0x00
+s2j_data:
+    .byte 0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0x3c,0xe7, 0xff
+s2d_data:
+    .byte 0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0xbc,0xe3
+d2s_data:
+    .byte 0xff
+    .byte 0x92,0xf3,0x09,0x62,0x95,0x2d,0x85,0x86
+    .byte 0xe9,0xaf,0xdd,0xe3,0xa2,0x0e,0xbc,0x19
+    .byte 0xa0,0xf1,0xff
+    .byte 0xff,0xff,0xff,0xff,0xff,0xff,0xff, 0x00
+
+;========================================================================
+; delay_fn — r18 = count. Uses r29.w0 as link (set by DELAY macro)
+;========================================================================
+    .sect ".text:delay"
+    .clink
+delay_fn:
+    qbeq ddret, r18, 0
+    mov r19, r18
+ddloop:
+    sub r19, r19, 1
+    qbne ddloop, r19, 0
+ddret:
+    jmp r29.w0
