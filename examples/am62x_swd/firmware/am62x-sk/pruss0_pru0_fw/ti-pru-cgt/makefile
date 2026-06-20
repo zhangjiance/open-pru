@@ -8,7 +8,7 @@ OUTPUT_NAME := am62x_swd_pruss0_pru0_fw
 # main_v2.c, swd.asm, rsc.c are in firmware/ (../../.. from this makefile)
 FILES_PATH := .. ../../.. .
 
-# Explicitly specify source files for zero-copy V2
+# Explicitly specify source files for zero-copy V2 (assembly optimized)
 C_FILES := main_v2.c rsc.c
 ASM_FILES := swd.asm
 

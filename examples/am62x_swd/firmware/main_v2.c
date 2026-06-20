@@ -11,6 +11,9 @@
 /* PRU DRAM base (from PRU perspective, DRAM starts at 0x0000) */
 #define PRU_DRAM_BASE  ((volatile uint8_t *)0x00000000)
 
+/* Fast queue index: QUEUE_SIZE=64 is power-of-2, mask replaces modulo */
+#define QMASK (QUEUE_SIZE - 1)
+
 /* DRAM pointers */
 volatile pru_control_t *ctrl;
 volatile dap_op_t *queue;
@@ -163,13 +166,16 @@ static void exec_ap_write(volatile dap_op_t *op)
     op->status = (op->ack == 1) ? 0 : 1;
 }
 
-/* Execute MEM_READ (auto CSW+TAR+DRW loop) */
+/* Execute MEM_READ (pipelined batch: CSW + TAR + N DRW + 1 RDBUFF) */
 static void exec_mem_read(volatile dap_op_t *op)
 {
+    uint32_t ack, i;
+    uint32_t drw_cmd, rdbuf_cmd, data;
+    
     /* Write CSW */
     ap_bankselect(op->ap_num, 0);
     uint32_t cmd = make_swd_cmd(1, 0, 0x00);  /* AP, WRITE, CSW */
-    uint32_t ack = swd_write_reg(cmd, op->csw_value);
+    ack = swd_write_reg(cmd, op->csw_value);
     if (ack != 1) { op->ack = ack; return; }
     
     /* Write TAR */
@@ -177,21 +183,35 @@ static void exec_mem_read(volatile dap_op_t *op)
     ack = swd_write_reg(cmd, op->reg);
     if (ack != 1) { op->ack = ack; return; }
     
-    /* Read DRW loop */
+    /* Batch DRW read pipeline: N words → N DRW + 1 RDBUFF.
+     * ADIv5: Each DRW read returns the PREVIOUS AP read result.
+     *   DRW[0] = dummy (stale), DRW[1..N] = words[0..N-1], RDBUFF = word[N] */
     uint32_t words = op->count / 4;
     uint32_t *buf = (uint32_t *)&data_buffer[op->data_offset];
-    uint32_t i;
-    cmd = make_swd_cmd(1, 1, 0x0C);  /* AP, READ, DRW */
     
-    for (i = 0; i < words; i++) {
-        uint32_t data;
-        ack = swd_read_reg(cmd, &data);
-        if (ack != 1) { op->ack = ack; return; }
-        buf[i] = data;
+    drw_cmd = make_swd_cmd(1, 1, 0x0C);  /* AP, READ, DRW */
+    rdbuf_cmd = make_swd_cmd(0, 1, 0xC);  /* DP, READ, RDBUFF */
+    
+    if (words == 0) { op->ack = 1; op->status = 0; return; }
+    
+    /* First DRW: dummy, starts pipeline */
+    ack = swd_read_reg(drw_cmd, &data);
+    if (ack != 1) { op->ack = ack; return; }
+    
+    /* words-1 DRW reads: each returns previous word */
+    for (i = 0; i < words - 1 && ack == 1; i++) {
+        ack = swd_read_reg(drw_cmd, &data);
+        if (ack == 1) buf[i] = data;
     }
     
-    op->ack = 1;
-    op->status = 0;
+    /* Final RDBUFF: gets the last word */
+    if (ack == 1) {
+        ack = swd_read_reg(rdbuf_cmd, &data);
+        if (ack == 1) buf[words - 1] = data;
+    }
+    
+    op->ack = ack;
+    op->status = (ack == 1) ? 0 : 1;
 }
 
 /* Execute single operation */
@@ -267,10 +287,124 @@ static void process_queue(void)
     uint32_t head = ctrl->queue_head;
     uint32_t tail = ctrl->queue_tail;
     
+    /* Batch variables (must be declared at top for TI clpru C89) */
+    uint32_t ap_num, batch_head, batch_count, ack, ap_bank;
+    uint32_t drw_cmd, rdbuf_cmd, data, batch_idx, fill_head, last_head;
+    uint32_t fail_head, i;
+    
     while (head != tail) {
-        volatile dap_op_t *op = &queue[head % QUEUE_SIZE];
+        volatile dap_op_t *op = &queue[head & QMASK];
+        
+        /* Batch consecutive AP DRW reads into a single pipeline burst.
+         * ADIv5 pipeline: each DRW read returns the PREVIOUS result.
+         * Pattern: 1 dummy DRW + N real DRW + 1 RDBUFF = N+2 ops for N words.
+         * Without batching: 2N ops. ~2x speedup for bulk reads. */
+        if (op->type == DAP_OP_AP_READ && (op->reg & 0xFF) == 0x0C) {  /* DRW only, not IDR */
+            ap_num = op->ap_num;
+            batch_head = head;
+            batch_count = 0;
+            
+            /* Count consecutive DRW reads on the same AP */
+            while (head != tail) {
+                volatile dap_op_t *next = &queue[head & QMASK];
+                if (next->type != DAP_OP_AP_READ || (next->reg & 0xFF) != 0x0C || next->ap_num != ap_num)
+                    break;
+                batch_count++;
+                head = (head + 1) & QMASK;
+            }
+            
+            if (batch_count == 1) {
+                /* Single DRW read — use standard path */
+                ctrl->reserved[1]++;  /* singleton counter */
+                head = batch_head;
+                execute_op(op);
+                head = (head + 1) & QMASK;
+            } else {
+                /* Batch DRW reads: N DRW + 1 RDBUFF */
+                ctrl->reserved[0]++;  /* batch counter */
+                
+                /* Setup AP banking once */
+                ap_bank = (op->reg >> 4) & 0xF;
+                ack = ap_bankselect(ap_num, ap_bank);
+                
+                if (ack == 1) {
+                    drw_cmd = make_swd_cmd(1, 1, 0x0C);  /* AP, READ, DRW */
+                    rdbuf_cmd = make_swd_cmd(0, 1, 0xC);  /* DP, READ, RDBUFF */
+                    
+                    /* Pipeline batch for N words: N DRW reads + 1 RDBUFF.
+                     * ADIv5: Each DRW read returns the PREVIOUS AP read result.
+                     * DRW[0] returns stale (dummy) — discard.
+                     * DRW[1..N-1] returns words[0..N-2].
+                     * RDBUFF returns word[N-1]. */
+                    
+                    /* First DRW: dummy, starts pipeline, data is stale */
+                    ack = swd_read_reg(drw_cmd, &data);
+                    
+                    fill_head = batch_head;
+                    
+                    if (ack == 1) {
+                        /* Second DRW: returns first real word */
+                        if (batch_count > 1) {
+                            ack = swd_read_reg(drw_cmd, &data);
+                            if (ack == 1) {
+                                volatile dap_op_t *first_op = &queue[fill_head & QMASK];
+                                first_op->rdata = data;
+                                first_op->ack = 1;
+                                first_op->status = 0;
+                                fill_head = (fill_head + 1) & QMASK;
+                            }
+                        }
+                        
+                        /* Remaining DRW reads (batch_count-2 more): each returns previous word */
+                        for (batch_idx = 2; batch_idx < batch_count && ack == 1; batch_idx++) {
+                            volatile dap_op_t *fill_op = &queue[fill_head & QMASK];
+                            ack = swd_read_reg(drw_cmd, &data);
+                            if (ack == 1) {
+                                fill_op->rdata = data;
+                                fill_op->ack = 1;
+                                fill_op->status = 0;
+                            }
+                            fill_head = (fill_head + 1) & QMASK;
+                        }
+                        
+                        /* Final RDBUFF: gets last word (word[N-1]) */
+                        if (ack == 1 && batch_count > 1) {
+                            ack = swd_read_reg(rdbuf_cmd, &data);
+                            if (ack == 1) {
+                                last_head = (batch_head + batch_count - 1) & QMASK;
+                                volatile dap_op_t *last_op = &queue[last_head & QMASK];
+                                last_op->rdata = data;
+                                last_op->ack = 1;
+                                last_op->status = 0;
+                            }
+                        }
+                    }
+                    
+                    /* If any failed, mark remaining ops as failed */
+                    if (ack != 1) {
+                        while (fill_head != head) {
+                            volatile dap_op_t *fail_op = &queue[fill_head & QMASK];
+                            fail_op->ack = ack;
+                            fail_op->status = 1;
+                            fill_head = (fill_head + 1) & QMASK;
+                        }
+                    }
+                } else {
+                    /* AP bank select failed */
+                    fail_head = batch_head;
+                    for (i = 0; i < batch_count; i++) {
+                        volatile dap_op_t *fail_op = &queue[fail_head & QMASK];
+                        fail_op->ack = ack;
+                        fail_op->status = 1;
+                        fail_head = (fail_head + 1) & QMASK;
+                    }
+                }
+            }
+            continue;
+        }
+        
         execute_op(op);
-        head = (head + 1) % QUEUE_SIZE;
+        head = (head + 1) & QMASK;
     }
     
     /* Update head pointer */
