@@ -5,8 +5,12 @@ include $(OPEN_PRU_PATH)/imports.mak
 OUTPUT_NAME := am62x_swd_pruss0_pru0_fw
 
 # Source file directories
-# main.asm, swd.asm, rsc.c are in firmware/ (../../.. from this makefile)
+# main_v2.c, swd.asm, rsc.c are in firmware/ (../../.. from this makefile)
 FILES_PATH := .. ../../.. .
+
+# Explicitly specify source files for zero-copy V2
+C_FILES := main_v2.c rsc.c
+ASM_FILES := swd.asm
 
 # Linker command file
 COMMAND_FILES := linker.cmd

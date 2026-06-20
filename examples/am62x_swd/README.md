@@ -1,477 +1,162 @@
-# AM62x PRU-SWD - ARM调试器项目
+# AM62x PRU-SWD — ARM Debug Probe via PRU
 
-基于 TI AM62x PRU-ICSS 实现的高速 SWD (Serial Wire Debug) 协议，将 BeaglePlay/PocketBeagle2 变成专业的 ARM 调试器。
+基于 TI AM62x PRU 实现的 SWD 调试适配器，配合 OpenOCD `dapdirect_swd` 驱动，
+将 PocketBeagle2 / BeaglePlay 变成 ARM Cortex-M 调试器。
 
-## 项目概述
-
-**功能：** 使用 PRU 实现 SWD 协议，用于调试 ARM Cortex-M 微控制器  
-**平台：** AM62x (BeaglePlay, PocketBeagle2)  
-**PRU 频率：** 333 MHz  
-**SWD 速度：** 1-10 MHz (可配置)  
-**语言：** PRU 汇编 (.p)  
-**基于：** beaglebone-pru-swd by NIIBE Yutaka
-
----
-
-## 核心特性
-
-### ✅ 高性能
-- **333 MHz PRU**：比原 AM335x (200MHz) 快 1.67 倍
-- **默认 3.3 MHz**：平衡速度与稳定性
-- **可达 10 MHz**：激进配置下，接近专业调试器水平
-
-### ✅ 纯汇编实现
-- 直接 PRU R30/R31 GPIO 控制
-- 无操作系统延迟
-- 纳秒级时序精度
-
-### ✅ 完整 SWD 协议
-- JTAG-to-SWD 切换序列
-- 读/写寄存器事务
-- ACK 响应处理
-- 奇偶校验
-
-### ✅ 可配置速度
-- 运行时调速
-- 7 档速度预设 (1-10 MHz)
-- 适配不同目标芯片
-
----
-
-## 目录结构
+## 架构
 
 ```
-am62x_swd/
-├── README.md                           # 本文档
-├── makefile                            # 项目构建脚本
-├── firmware/
-│   ├── main.p                          # PRU 汇编主程序 (SWD 核心)
-│   └── am62x-sk/
-│       └── pruss0_pru0_fw/
-│           └── ti-pru-cgt/
-│               ├── makefile            # 核心编译脚本
-│               ├── linker.cmd          # 链接配置
-│               └── generated/          # 编译输出 (.out)
-└── linux/
-    └── swd_test/
-        ├── Makefile                    # Linux 程序编译
-        └── swd_test.c                  # 测试程序
+OpenOCD (ARM A53, Linux)
+  └─ dapdirect_swd transport
+       └─ am62x_pru_swd.c (dap_ops: connect, queue_dp_read/write, queue_ap_read/write, run)
+            └─ 共享内存 mailbox @ PRU DRAM 0x30041000
+                 └─ PRU0 firmware (main.asm + swd.asm, 200MHz PRU)
+                      └─ SWD bus (CLK + DIO GPIO bit-bang)
 ```
 
----
+## Mailbox 协议
+
+| Word | 名称 | 方向 | 说明 |
+|------|------|------|------|
+| 0 | CMD | ARM→PRU | 命令码 (0-6) |
+| 1 | PARAM | ARM→PRU | 寄存器号 或 (AP号<<8)\|reg |
+| 2 | WDATA | ARM→PRU | 写数据 |
+| 4 | RDATA | PRU→ARM | 读数据 |
+| 5 | ACK | PRU→ARM | SWD ACK (1=OK, 2=WAIT, 4=FAULT) |
+| 6 | STATUS | PRU→ARM | 0=成功, 1=失败 |
+| 7 | SPEED | ARM→PRU | DELAY 循环次数 (SWD 时钟) |
+| 9 | RDBUFF | PRU→ARM | AP 读自动缓存的 RDBUFF 值 |
+| 10 | FLAGS | PRU→ARM | bit0=1 表示 RDBUFF 有效 |
+| 16 | DOORBELL | ARM↔PRU | ARM 写序列号，PRU 清 0 表示完成 |
+
+**协议**：ARM 写 CMD/PARAM/WDATA/DB → PRU 轮询 DB → 执行 → 写 RDATA/ACK/STATUS → 清 DB → ARM 读结果。同步阻塞，单槽位。
+
+## PRU 命令 (0-6)
+
+| 码 | 命令 | PARAM | WDATA | → RDATA | PRU 内部 |
+|----|------|-------|-------|---------|---------|
+| 0 | CONNECT | - | - | DPIDR | line reset + J2S + 读 DPIDR + ABORT 清 sticky |
+| 1 | DP_RD | reg | - | value | reg[3:0]==4 自动写 SELECT (bankselect) |
+| 2 | DP_WR | reg | data | - | 同上 |
+| 3 | AP_RD | (ap<<8)\|reg | - | pipelined | 自动 SELECT(APSEL+APBANKSEL) + 读 RDBUFF |
+| 4 | AP_WR | (ap<<8)\|reg | data | - | 自动 SELECT |
+| 5 | LR | - | - | - | line reset, 清 SELECT 缓存 |
+| 6 | J2S | - | - | - | JTAG-to-SWD, 清 SELECT 缓存 |
+
+## PRU firmware (main.asm + swd.asm)
+
+### SWD 协议层 (swd.asm)
+- `swd_read_reg` / `swd_write_reg`：完整 SWD 读写事务
+- `tx_bits` / `rx_bits`：8/32/1-bit 收发
+- `turnaround_input` / `turnaround_output`：TRN 方向切换（1 个 SWD 时钟周期）
+- 写操作 parity 后 1 个 idle 周期，读操作 TRN_out 后释放总线
+
+### DAP 层 (main.asm)
+- **`swd_mkcmd`**：从 reg + APnDP + RnW 构造 8-bit SWD 命令字节
+  - bit0=START, bit1=APnDP, bit2=RnW, bit3-4=A[3:2], bit5=PARITY, bit7=PARK
+- **`swd_ap_sel`**：AP SELECT 管理，保留 DPBANKSEL 缓存
+- **`swd_dp_bs`**：DP bankselect（reg 4 写 SELECT）
+- **SELECT 缓存 (r9/r10)**：跨命令保持，减少冗余 SELECT 写
+- **RDBUFF 自动缓存**：AP 读后自动读 RDBUFF 存 `M_RDBUFF`
+
+### 寄存器约定
+- `r3.w2`：C-callable 返回地址 (jal r3.w2)
+- `r28.w0`：内部子程序返回地址 (jal r28.w0)
+- `r1-r13`：被 `swd_write_reg` 保留
+- `r5/r6`：用于在 `swd_ap_sel`/`swd_dp_bs` 调用前后保存参数
+
+## ARM OpenOCD 驱动 (am62x_pru_swd.c)
+
+### dap_ops 接口
+
+```
+connect        → CMD_CONNECT → dap_dp_init(dap) [框架函数，走 queue_dp_write/read + run]
+send_sequence  → CMD_LR 或 CMD_J2S
+queue_dp_read  → CMD_DP_RD (DP_RDBUFF 走缓存)
+queue_dp_write → CMD_DP_WR (CTRL_STAT 屏蔽 CORUNDETECT)
+queue_ap_read  → CMD_AP_RD → 框架 dap_run 时 pru_run 读 RDBUFF 回填 *data
+queue_ap_write → CMD_AP_WR
+queue_ap_abort → CMD_DP_WR(DP_ABORT, 0x1E)
+run            → 检查 M_FLAGS → 有则缓存 RDBUFF → 有 pending AP read 则读 RDBUFF
+```
+
+### Pipeline 管理
+SWD AP 读是 pipelined：AP read 返回 stale 值，真值在 RDBUFF。`swd_dap_ops` 用 `dap->last_read` + `swd_finish_read` 实现。
+我们使用 `pending_ap_read` 指针：`queue_ap_read` 保存 data 指针 → `run()` 发 `CMD_DP_RD(RDBUFF)` 回填。
+
+### CORUNDETECT
+STM32F0 不支持 CORUNDETECT，写 CTRL_STAT 时屏蔽（匹配 ST-Link 行为）。
+
+## 构建 & 部署
+
+```bash
+# PRU firmware
+cd open-pru/examples/am62x_swd/firmware/am62x-sk/pruss0_pru0_fw/ti-pru-cgt
+make clean && make
+scp generated/am62x_swd_pruss0_pru0_fw.out root@192.168.7.2:/lib/firmware/am62x-pru0-fw
+
+# OpenOCD
+cd openocd
+make -j16
+scp src/openocd root@192.168.7.2:/tmp/openocd
+
+# 重启 PRU
+ssh root@192.168.7.2
+echo stop > /sys/class/remoteproc/remoteproc1/state
+echo start > /sys/class/remoteproc/remoteproc1/state
+
+# 测试
+sudo /tmp/openocd -s /home/beagle/openocd/share/openocd/scripts \
+  -f interface/am62x-pru-swd.cfg -f target/stm32f0x.cfg -d3
+```
+
+## 当前进展
+
+| 阶段 | 状态 |
+|------|------|
+| SWD 协议层 (tx/rx/TRN/parity/idle) | ✅ 正常 |
+| DP 读写 (IDCODE, CTRL/STAT, SELECT, ABORT) | ✅ 正常 |
+| dap_dp_init (power-up + CDBGPWRUPACK/CSYSPWRUPACK poll) | ✅ 正常 |
+| MEM-AP 发现 (dap_find_get_ap → IDR=0x04770021) | ✅ 正常 |
+| CSW 写 (0xA2000012) | ✅ 正常 |
+| TAR 写 / DRW 读 | ❌ TAR 写 ACK=6，排查中 |
+
+## 已知问题
+
+1. **TAR AP 写失败 (ACK=6)**：CSW 写成功后 TAR 写 target 返回异常 ACK。
+   分析：正常波形 CSW→TAR 之间 `swd_queue_ap_write` 调 `check_sync` 做 idle，
+   当前正在验证 `pru_queue_ap_write` 末尾加 RDBUFF 读是否解决。
+
+2. **寄存器冲突**：`swd_ap_sel`/`swd_dp_bs` 内部 `jal r3.w2, swd_write_reg` 会
+   破坏 `r28.w0`、`r1`、`r25`、`r26`。已修复：用 r1 保存 r28.w0，用 r5/r6 保存参数。
+
+3. **SWD 命令 bit 布局**：之前 START/PARK/PARITY 位置错误。已修正为与 OpenOCD
+   `swd_cmd()` 一致：bit0=START, bit5=PARITY, bit7=PARK。
 
 ## 硬件连接
 
-### 引脚映射（可通过 Device Tree 配置）
+| PRU 引脚 | 功能 | 目标 |
+|----------|------|------|
+| PRU0_GPO8 (R30.8) | SWCLK | SWCLK |
+| PRU0_GPO9 (R30.9) | SWDIO (out) | SWDIO |
+| PRU0_GPI9 (R31.9) | SWDIO (in) | SWDIO |
+| GND | 地 | GND |
 
-**双引脚 DIO 配置（推荐）：**
-
-| PRU 信号 | GPIO | 方向 | 功能 | 目标芯片 |
-|----------|------|------|------|---------|
-| PRU0_GPO0 | 可配置 | 输出 | **SWD_CLK** | SWCLK |
-| PRU0_GPO1 | 可配置 | 输出 | **SWD_DIO_OUT** | SWDIO |
-| PRU0_GPI1 | 可配置 | 输入 | **SWD_DIO_IN** | SWDIO |
-| PRU0_GPO2 | 可配置 | 输出 | **SRST** | nRST (可选) |
-| GND | GND | - | 地 | GND |
-
-**注意：**
-- ✅ SWD_DIO_OUT 和 SWD_DIO_IN **连接到同一个目标 SWDIO 引脚**
-- ✅ 这种双引脚方案**消除了方向切换开销**，简化时序
-- ✅ PRU R30 寄存器用于输出（CLK, DIO_OUT），R31 用于输入（DIO_IN）
-- ✅ 比单引脚双向方案更快、更简单（无需 GPIO 方向切换）
-
-### 连接示例
+## 文件结构
 
 ```
-BeaglePlay                    目标 ARM (如 STM32)
-  GPIO_X (PRU0_GPO0)  ────→  SWCLK
-  GPIO_Y (PRU0_GPO1)  ────→  SWDIO  ┐
-                                     ├─ 同一引脚
-  GPIO_Y (PRU0_GPI1)  ←────  SWDIO  ┘
-  GPIO_Z (PRU0_GPO2)  ────→  nRST
-  GND                 ────→  GND
-  3.3V                ────→  VDD (可选供电)
+am62x_swd/
+├── firmware/
+│   ├── main.asm       # PRU 主循环 + DAP 命令处理
+│   ├── swd.asm        # SWD 协议层函数
+│   └── am62x-sk/pruss0_pru0_fw/ti-pru-cgt/
+│       ├── makefile / linker.cmd
+│       └── generated/*.out
+├── linux/swd_test/    # (old) standalone test
+├── makefile
+├── deploy_swd.sh      # 自动部署脚本
+└── README.md
+
+openocd/src/jtag/drivers/
+└── am62x_pru_swd.c    # OpenOCD dap_ops 驱动
 ```
-
-**注意：**
-- ✅ **双引脚 DIO 设计**：输出和输入使用独立的 PRU 引脚（R30/R31），但连接到**同一个**目标 SWDIO
-- ✅ **无需方向切换**：相比单引脚双向方案，消除了 GPIO 方向切换的复杂性和延迟
-- ✅ **更高性能**：减少 TRN（Turn-around）周期的时间开销
-- ✅ 建议使用 **10-20cm 短线**，减少信号干扰
-- ✅ 高速模式 (>6 MHz) 建议使用**屏蔽线**
-
----
-
-## 编译和部署
-
-### 前置条件
-
-1. **TI PRU Code Generation Tools** v2.3.3+
-2. **OpenPRU 构建系统**
-3. **设置环境变量：**
-   ```bash
-   export OPEN_PRU_PATH=/path/to/open-pru
-   export PRU_CGT=/path/to/ti-cgt-pru_2.3.3
-   ```
-
-### 编译 PRU 固件
-
-```bash
-cd /path/to/open-pru/examples/am62x_swd
-make clean
-make
-```
-
-生成文件：
-```
-firmware/am62x-sk/pruss0_pru0_fw/ti-pru-cgt/generated/am62x_swd_pruss0_pru0_fw.out
-```
-
-### 编译测试程序
-
-```bash
-cd linux/swd_test
-make
-```
-
-### 部署到目标设备
-
-**1. 上传固件**
-```bash
-scp firmware/am62x-sk/pruss0_pru0_fw/ti-pru-cgt/generated/*.out \
-    root@192.168.7.2:/lib/firmware/am62x-pru0-fw
-```
-
-**2. 上传测试程序**
-```bash
-scp linux/swd_test/swd_test root@192.168.7.2:/tmp/
-```
-
-**3. 启动 PRU（在目标设备上）**
-```bash
-ssh root@192.168.7.2
-
-# 停止 PRU
-echo stop > /sys/class/remoteproc/remoteproc1/state
-
-# 加载新固件
-echo start > /sys/class/remoteproc/remoteproc1/state
-
-# 验证状态
-cat /sys/class/remoteproc/remoteproc1/state
-# 应显示: running
-```
-
-**4. 运行测试程序**
-```bash
-sudo /tmp/swd_test
-```
-
----
-
-## 使用指南
-
-### 测试程序菜单
-
-```
-========================================
-   AM62x PRU-SWD Test Program
-========================================
-
-Commands:
-  0 - Show PRU status
-  1 - Blink test              (测试 GPIO 输出)
-  2 - GPIO test               (手动控制 GPIO)
-  3 - SWD idle cycles         (空闲时钟)
-  4 - SWD line reset pattern  (线路复位)
-  5 - JTAG-to-SWD sequence    (协议切换)
-  6 - Read IDCODE             (读取芯片 ID)
-  s - Set SWD speed           (调整速度)
-  q - Quit
-```
-
-### 速度配置
-
-| 延时常数 | 实际频率 | 适用场景 |
-|---------|---------|---------|
-| 78 | ~1.0 MHz | 保守，长线缆 |
-| 47 | ~1.7 MHz | 兼容性好 |
-| **28** | **~3.3 MHz** | **默认推荐** |
-| 14 | ~6.4 MHz | STM32F4 上限 |
-| 7 | ~10 MHz | 极限速度，短线 |
-
-**调速方法：**
-```c
-// 在测试程序中选择 's'
-Enter delay cycles (7-78): 14  // 输入 14 设置为 6.4 MHz
-```
-
-或直接写入 PRU DRAM：
-```c
-*((uint8_t *)pru_dram) = 14;  // 设置 SPEED_CONFIG
-```
-
----
-
-## SWD 协议详解
-
-### 命令接口
-
-PRU 通过共享内存 (PRU DRAM) 接收命令：
-
-| 命令 | 值 | 输入 | 输出 | 功能 |
-|------|-----|------|------|------|
-| **HALT** | 0 | - | - | 停止 PRU |
-| **BLINK** | 1 | delay, count, bit | - | LED 闪烁测试 |
-| **GPIO_OUT** | 2 | bit, value | - | 设置 GPIO |
-| **GPIO_IN** | 3 | - | value | 读取 GPIO |
-| **SIG_IDLE** | 4 | count | - | 发送空闲周期 |
-| **SIG_GEN** | 5 | bit_len, data[] | - | 发送位模式 |
-| **READ_REG** | 6 | cmd, idle | ack, data | SWD 读寄存器 |
-| **WRITE_REG** | 7 | cmd, data, parity | ack | SWD 写寄存器 |
-
-### READ_REG 事务流程
-
-```
-1. 发送 8-bit 命令头
-   格式: Start(1) + APnDP(1) + RnW(1) + A[2:3](2) + Parity(1) + Stop(1) + Park(1)
-   
-2. TRN (Turn-around)
-   切换 DIO 为输入模式
-   
-3. 接收 3-bit ACK
-   0x1 = OK
-   0x2 = WAIT
-   0x4 = FAULT
-   
-4. 接收 32-bit 数据
-   
-5. 接收 1-bit 奇偶校验
-   
-6. TRN
-   切换 DIO 回输出模式
-   
-7. 可选 IDLE 周期
-```
-
-### 示例：读取 IDCODE
-
-```c
-// IDCODE 寄存器命令
-// APnDP=0, RnW=1, A[2:3]=00, Parity=1
-// 二进制: 1-0-1-00-1-0-1 = 0xA5
-
-pru_dram[0] = CMD_READ_REG;   // 命令
-pru_dram[1] = 0xA5;            // IDCODE 命令字节
-pru_dram[2] = 8;               // 事务后 8 个空闲周期
-
-// 发送命令...
-
-// 读取结果
-uint32_t ack = pru_dram[64/4];     // ACK + Parity
-uint32_t idcode = pru_dram[68/4];  // IDCODE 值
-
-printf("IDCODE = 0x%08X\n", idcode);
-```
-
----
-
-## 性能对比
-
-| 调试器 | SWD 速度 | 价格 | 平台 |
-|--------|----------|------|------|
-| **AM62x PRU-SWD** | **3.3 MHz (默认)** | ~$60 | BeaglePlay |
-| **AM62x PRU-SWD** | **10 MHz (最大)** | ~$60 | BeaglePlay |
-| ST-Link V2 | 4 MHz | ~$20 | 专用硬件 |
-| J-Link EDU | 4 MHz | ~$60 | 专用硬件 |
-| J-Link PLUS | 15 MHz | ~$500 | 专用硬件 |
-| OpenOCD FT2232 | 6 MHz | ~$30 | USB 适配器 |
-
-**优势：**
-- ✅ 性价比高（开发板本身有其他用途）
-- ✅ 可编程（完全开源，可定制）
-- ✅ 学习 PRU 编程的绝佳案例
-- ✅ 速度接近商业调试器
-
----
-
-## 调试和故障排查
-
-### 常见问题
-
-**1. PRU 无法启动**
-```bash
-# 检查 PRU 状态
-cat /sys/class/remoteproc/remoteproc1/state
-
-# 查看内核日志
-dmesg | grep pru
-
-# 确保固件路径正确
-ls -l /lib/firmware/am62x-pru0-fw
-```
-
-**2. 读取 IDCODE 失败**
-- ✓ 检查硬件连接（SWCLK, SWDIO, GND）
-- ✓ 确保目标芯片供电
-- ✓ 尝试降低速度（设置 delay=78）
-- ✓ 发送 JTAG-to-SWD 切换序列
-- ✓ 发送线路复位
-
-**3. 通信不稳定**
-- 使用**短线**（<20cm）
-- 降低速度
-- 添加上拉电阻（SWDIO: 10kΩ）
-- 检查信号完整性（示波器）
-
-**4. 编译错误**
-```bash
-# 检查环境变量
-echo $OPEN_PRU_PATH
-echo $PRU_CGT
-
-# 检查编译器版本
-$PRU_CGT/bin/clpru --version
-```
-
----
-
-## 扩展应用
-
-### 与 OpenOCD 集成
-
-理论上可以参考原 beaglebone-pru-swd 的 OpenOCD 补丁进行移植：
-
-```bash
-# 编译 OpenOCD with BBG-SWD driver
-./configure --enable-bbg-swd
-make
-sudo make install
-
-# 配置文件
-cat > am62x-swd.cfg << EOF
-interface bbg-swd
-transport select swd
-EOF
-
-# 启动调试会话
-openocd -f am62x-swd.cfg -f target/stm32f1x.cfg
-```
-
-### 支持的目标芯片
-
-| 系列 | 型号 | 最高 SWD 速度 | 测试状态 |
-|------|------|--------------|---------|
-| STM32F0 | STM32F030 | 4 MHz | 待测试 |
-| STM32F1 | STM32F103 | 4 MHz | 待测试 |
-| STM32F4 | STM32F407 | 10 MHz | 待测试 |
-| STM32H7 | STM32H743 | 24 MHz | 需优化 |
-| NXP | KL27Z256 | 8 MHz | 待测试 |
-| Nordic | nRF52832 | 8 MHz | 待测试 |
-| RP2040 | Pico | 30 MHz | 需极限优化 |
-
----
-
-## 技术细节
-
-### 时序分析
-
-**333 MHz PRU (3ns/cycle)，delay=28：**
-```
-DRIVE_CLK_LOW    1 cycle   (3ns)
-DRIVE_DIO        1 cycle   (3ns)
-DELAY            28 cycles (84ns)
-DRIVE_CLK_HIGH   1 cycle   (3ns)
-DELAY            28 cycles (84ns)
-NOP              1 cycle   (3ns)
-──────────────────────────────────
-总计             60 cycles (180ns)
-
-完整周期 = 2 * 180ns = 360ns
-频率 = 1/360ns ≈ 2.78 MHz
-
-实际测量 ~3.3 MHz (考虑指令流水线优化)
-```
-
-### 内存布局
-
-```
-PRU0 DRAM (8KB):
-  0x00      - Speed config (1 byte)
-  0x01-0x03 - 保留
-  0x04-0x3F - 命令参数区 (60 bytes)
-  0x40-0x47 - 返回值区 (8 bytes)
-  0x48-0x4F - 保留
-  0x50      - 命令计数器 (4 bytes)
-```
-
-### 代码大小
-
-```
-main.p 编译后:
-  .text    ~2.5 KB  (代码段)
-  .data    ~0.1 KB  (数据段)
-  总计     ~2.6 KB  (占用 16KB IRAM 的 16%)
-```
-
----
-
-## 开发路线图
-
-- [ ] 基础 SWD 读写功能 ✅
-- [ ] 速度配置支持 ✅
-- [ ] Linux 测试程序 ✅
-- [ ] OpenOCD 驱动移植 (进行中)
-- [ ] 双向 DIO 优化
-- [ ] IEP Timer 精确延时
-- [ ] 批量读写优化
-- [ ] Flash 编程支持
-- [ ] 多目标自动检测
-
----
-
-## 许可证
-
-- **PRU 固件 (main.p):** GPLv3+
-- **Linux 测试程序:** GPLv3+
-- **文档:** CC-BY-SA 4.0
-
----
-
-## 参考资料
-
-**核心文档：**
-- [ARM Debug Interface (ADI) v5 Spec](https://developer.arm.com/documentation/ihi0031/latest/)
-- [SWD Protocol Guide](https://developer.arm.com/documentation/ddi0316/latest/)
-- [AM62x TRM - PRU-ICSS](https://www.ti.com/lit/spruiv7)
-
-**原始项目：**
-- [beaglebone-pru-swd](https://github.com/sanchox/beaglebone-pru-swd) by NIIBE Yutaka
-
-**相关工具：**
-- [OpenOCD](https://openocd.org/)
-- [OpenPRU](https://github.com/beagleboard/openPRU)
-
----
-
-## 贡献
-
-欢迎贡献代码、测试报告和文档改进！
-
-**测试反馈：**
-- 在不同目标芯片上的测试结果
-- 速度/稳定性调优建议
-- 硬件连接最佳实践
-
-**代码改进：**
-- IEP Timer 延时
-- R30/R31 直接 GPIO 完整实现
-- OpenOCD 驱动适配
-
----
-
-**项目创建：** 2026-05-23  
-**版本：** 0.1-alpha  
-**状态：** 实验性，欢迎测试反馈
-
-🚀 享受 PRU 编程的乐趣！

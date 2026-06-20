@@ -29,8 +29,8 @@ KICK1_UNLOCK   .set 0xD172BC5A
 PADCFG_CLK     .set 0x000F40B8
 PADCFG_DIO     .set 0x000F40BC
 MODE_CLK_OUT   .set 0x00050005
-MODE_DIO_OUT   .set 0x00050005
-MODE_DIO_RX    .set 0x00070006   ; pull-up enabled (bit 16), input enabled (bit 18)
+MODE_DIO_OUT   .set 0x00050005   ; push-pull output (TODO: open-drain value?)
+MODE_DIO_RX    .set 0x00050006   ; input enabled, no pull-up (external pull-up used)
 
 ;========================================================================
 ; Macros
@@ -93,6 +93,7 @@ tx_setup:
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
     sbbo &r17, r16, 0, 4
+    DIO_HI
     jmp r28.w0
 
 ;========================================================================
@@ -146,46 +147,35 @@ rxb_z:
     jmp r28.w0
 
 ;========================================================================
-; turnaround_input — release DIO for target. Called via jal r28.w0.
-; Uses short fixed delays (~55ns+35ns) instead of DELAY to minimize TRN.
+; turnaround_input — release DIO for target.  One full SWD clock cycle.
+; Brief push-pull low for TRN, then input — external pull-up holds high.
 ;========================================================================
 turnaround_input:
     CLK_LO
-    DIO_LO           ; release DIO
+    DIO_HI                  ; preset high — no glitch on release
+    DELAY
+    CLK_HI                  ; TRN: CLK high
+    DELAY
+    CLK_LO                  ; TRN ends
+    ; Release to input — external pull-up holds high
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_RX
-    sbbo &r17, r16, 0, 4
-    ldi r19, 5       ; short fixed delay for L3 write to settle (~55ns)
-ti_dly1:
-    sub r19, r19, 1
-    qbne ti_dly1, r19, 0
-    CLK_HI            ; TRN bit
-    ldi r19, 3       ; clock high (~35ns)
-ti_dly2:
-    sub r19, r19, 1
-    qbne ti_dly2, r19, 0
-    CLK_LO
+    sbbo &r17, r16, 0, 4   ; input mode
     jmp r28.w0
 
 ;========================================================================
-; turnaround_output — reclaim DIO. Called via jal r28.w0.
-; Uses short fixed delays (~55ns+35ns) instead of DELAY to minimize TRN.
+; turnaround_output — reclaim DIO after target was driving (READ only).
+; One full TRN clock cycle: host drives DIO low, then releases.
 ;========================================================================
 turnaround_output:
-    CLK_LO
+    DIO_LO                  ; preset output register low (glitch-free)
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
-    sbbo &r17, r16, 0, 4
-    ldi r19, 5       ; short fixed delay for L3 write to settle (~55ns)
-to_dly1:
-    sub r19, r19, 1
-    qbne to_dly1, r19, 0
-    CLK_HI
-    ldi r19, 3       ; clock high (~35ns)
-to_dly2:
-    sub r19, r19, 1
-    qbne to_dly2, r19, 0
-    CLK_LO
+    sbbo &r17, r16, 0, 4   ; switch to output → DIO already low
+    DELAY                   ; TRN: CLK low, DIO low
+    CLK_HI                  ; TRN: CLK high, DIO low
+    DELAY
+    CLK_LO                  ; TRN ends
     jmp r28.w0
 
 ;========================================================================
@@ -343,7 +333,7 @@ swd_read_reg:
     jal r28.w0, rx_bits
     sbbo &r21, r22, 0, 4     ; store to *data
 
-    ; Read parity
+    ; Read parity (1 bit, same timing as rx_bits)
     DELAY
     CLK_HI
     ldi r24, 0          ; default: parity=0
@@ -353,7 +343,16 @@ rd_pdone:
     DELAY
     CLK_LO
 
-    jal r28.w0, turnaround_output
+    ; Reclaim DIO: CLK_LO → switch PAD to TX → DELAY → DIO_LO → CLK_HI
+    ldi32 r16, PADCFG_DIO
+    ldi32 r17, MODE_DIO_OUT
+    sbbo &r17, r16, 0, 4   ; switch to output first
+    DELAY                   ; let PAD stabilize
+    DIO_LO                  ; drive low after PAD ready
+    DELAY
+    CLK_HI                  ; TRN high
+    DELAY
+    CLK_LO                  ; TRN ends
     mov r14, r20
     jmp r3.w2
 
@@ -378,21 +377,16 @@ swd_write_reg:
     jal r28.w0, rx_bits
     mov r20, r21
 
-    ; TRN cycle: switch to output mode (short fixed delays)
+    ; TRN cycle: reclaim DIO from target after ACK (one full clock)
     CLK_LO
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
-    sbbo &r17, r16, 0, 4
-    ldi r19, 5       ; short fixed delay for L3 write (~55ns)
-wr_trn1:
-    sub r19, r19, 1
-    qbne wr_trn1, r19, 0
-    CLK_HI         ; TRN bit
-    ldi r19, 3       ; clock high (~35ns)
-wr_trn2:
-    sub r19, r19, 1
-    qbne wr_trn2, r19, 0
-    CLK_LO
+    sbbo &r17, r16, 0, 4   ; switch to output
+    DIO_LO                  ; drive low
+    DELAY                   ; TRN: CLK low, DIO low
+    CLK_HI                  ; TRN: CLK high, DIO low
+    DELAY
+    CLK_LO                  ; TRN ends
 
     ; Pre-drive bit 0 — separate from TRN cycle
     and r0, r22, 1
@@ -440,6 +434,11 @@ wr_phi:
     CLK_HI
     DELAY
     CLK_LO
+    DIO_LO
+    DIO_HI
+    ldi32 r16, PADCFG_DIO
+    ldi32 r17, MODE_DIO_RX
+    sbbo &r17, r16, 0, 4   ; release to input (external pull-up → high)
 
     mov r14, r20
     jmp r3.w2
