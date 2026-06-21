@@ -163,16 +163,16 @@ turnaround_input:
 
 ;========================================================================
 ; turnaround_output — reclaim DIO. Called via jal r28.w0.
-; R30.t9 already 1 from turnaround_input → pin goes cleanly HIGH at mode switch.
+; Mode switch then TRN clock — DELAY covers L3 settle, no extra delay.
 ;========================================================================
 turnaround_output:
     CLK_LO
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
-    sbbo &r17, r16, 0, 4   ; R30.t9=1 → DIO HIGH immediately, no glitch
-    DELAY            ; wait for L3 write + match CLK_LO width
-    CLK_HI
-    DELAY            ; match CLK_HI width (same as regular bit)
+    sbbo &r17, r16, 0, 4   ; switch to output
+    DELAY            ; L3 settle + CLK_LO width
+    CLK_HI            ; TRN rising edge
+    DELAY            ; CLK_HI width
     CLK_LO
     jmp r28.w0
 
@@ -386,17 +386,11 @@ wr_retry:
     ; Max retries exhausted, fall through
 
 wr_no_wait:
-    ; TRN cycle: R30.t9=1 from turnaround_input → clean HIGH at mode switch
-    CLK_LO
+    ; Mode switch + bit0 pre-drive, then TRN clock — no extra settle delay
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
-    sbbo &r17, r16, 0, 4   ; DIO immediately HIGH (R30.t9 already 1)
-    DELAY            ; L3 settle + CLK_LO width
-    CLK_HI            ; TRN rising edge
-    DELAY            ; CLK_HI width
-    CLK_LO
-
-    ; Pre-drive bit 0 — separate from TRN cycle
+    sbbo &r17, r16, 0, 4   ; switch to output, DIO immediately HIGH
+    ; Pre-drive bit 0 right after PADCFG switch
     and r0, r22, 1
     qbbs wr_hi, r0, 0
     DIO_LO
@@ -404,8 +398,15 @@ wr_no_wait:
 wr_hi:
     DIO_HI
 wr_clk:
-    DELAY          ; setup
-    CLK_HI          ; target samples bit 0
+    ; TRN clock (DELAY covers mode switch settle + CLK_LO width)
+    CLK_LO
+    DELAY
+    CLK_HI            ; TRN rising edge
+    DELAY
+    CLK_LO
+    ; Bit 0 clock
+    DELAY
+    CLK_HI            ; target samples bit 0
     DELAY
     CLK_LO
 
