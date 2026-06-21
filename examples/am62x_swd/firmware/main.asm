@@ -104,16 +104,18 @@ brd_done:
     ldi  r27, 0
     qba  finish
 
-; ---- Batch: process r25 sub-commands from seq_buf (each 3 words) ----
+; ---- Batch: r25 sub-commands from seq_buf (2 words each: [type:8|arg1:24][arg2:32]) ----
 do_batch:
     ldi32 r2, 0x1044         ; seq_buf at MB+68
-    mov  r6, r25             ; count (r6 safe from jal r3.w2)
+    mov  r6, r25             ; count
     ldi32 r5, 0x1100         ; scratch for read data
     qbeq batch_done, r6, 0
 batch_lp:
-    lbbo &r24, r2, 0, 4      ; sub-cmd type
-    lbbo &r25, r2, 4, 4      ; arg1 (SWD cmd byte or idle count)
-    lbbo &r26, r2, 8, 4      ; arg2 (write data)
+    lbbo &r20, r2, 0, 4      ; packed: [type:8][arg1:24]
+    lbbo &r26, r2, 4, 4      ; arg2 (write data)
+    mov  r24, r20
+    and  r24, r24, 0xFF       ; type = low 8 bits
+    lsr  r25, r20, 8          ; arg1 = high 24 bits
     ldi  r21, 1
     ldi  r27, 0
     qbeq batch_rd, r24, 1    ; CMD_SWD_READ
@@ -138,9 +140,9 @@ batch_idle:
     jal  r3.w2, swd_idle_cycles
     qba  batch_next
 batch_next:
-    sbbo &r27, r2, 0, 4      ; rdata
-    sbbo &r21, r2, 4, 4      ; ack
-    add  r2, r2, 12
+    sbbo &r27, r2, 0, 4      ; rdata (overwrites packed word)
+    sbbo &r21, r2, 4, 4      ; ack   (overwrites arg2)
+    add  r2, r2, 8            ; advance 2 words
     sub  r6, r6, 1
     qbne batch_lp, r6, 0
 batch_done:

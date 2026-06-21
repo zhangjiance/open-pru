@@ -106,19 +106,18 @@ rx_setup:
 
 ;========================================================================
 ; tx_bits — r26=data(LSB), r25=bit count. Called via jal r28.w0.
-; DELAY clobbers r19 so r28.w0 is preserved.
+; Drives DIO_HI first, then DIO_LO only if bit=0 — symmetric 4-cycle preamble
+; for both bit values, no wasted qba branch.
 ;========================================================================
 tx_bits:
 txb_loop:
     and r0, r26, 1
     lsr r26, r26, 1
     CLK_LO
-    qbbs txb_hi, r0, 0
-    DIO_LO
-    qba txb_done
-txb_hi:
-    DIO_HI
-txb_done:
+    DIO_HI              ; default HIGH
+    qbbs txb_clk, r0, 0 ; bit=1 → keep HIGH
+    DIO_LO              ; bit=0 → drive LOW
+txb_clk:
     DELAY
     CLK_HI
     DELAY
@@ -147,91 +146,76 @@ rxb_z:
 
 ;========================================================================
 ; turnaround_input — release DIO for target. Called via jal r28.w0.
-; Uses short fixed delays (~55ns+35ns) instead of DELAY to minimize TRN.
+; Pre-drives DIO_HI so the pin stays HIGH through the output→input transition.
+; Uses DELAY so TRN clock timing matches the current SWD bit rate.
 ;========================================================================
 turnaround_input:
     CLK_LO
-    DIO_LO           ; release DIO
+    DIO_HI           ; keep DIO HIGH (Park=1) — no glitch on release
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_RX
     sbbo &r17, r16, 0, 4
-    ldi r19, 5       ; short fixed delay for L3 write to settle (~55ns)
-ti_dly1:
-    sub r19, r19, 1
-    qbne ti_dly1, r19, 0
-    CLK_HI            ; TRN bit
-    ldi r19, 3       ; clock high (~35ns)
-ti_dly2:
-    sub r19, r19, 1
-    qbne ti_dly2, r19, 0
+    DELAY            ; wait for L3 write + match CLK_LO width
+    CLK_HI            ; TRN rising edge
+    DELAY            ; match CLK_HI width (same as regular bit)
     CLK_LO
     jmp r28.w0
 
 ;========================================================================
 ; turnaround_output — reclaim DIO. Called via jal r28.w0.
-; Uses short fixed delays (~55ns+35ns) instead of DELAY to minimize TRN.
+; R30.t9 already 1 from turnaround_input → pin goes cleanly HIGH at mode switch.
 ;========================================================================
 turnaround_output:
     CLK_LO
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
-    sbbo &r17, r16, 0, 4
-    ldi r19, 5       ; short fixed delay for L3 write to settle (~55ns)
-to_dly1:
-    sub r19, r19, 1
-    qbne to_dly1, r19, 0
+    sbbo &r17, r16, 0, 4   ; R30.t9=1 → DIO HIGH immediately, no glitch
+    DELAY            ; wait for L3 write + match CLK_LO width
     CLK_HI
-    ldi r19, 3       ; clock high (~35ns)
-to_dly2:
-    sub r19, r19, 1
-    qbne to_dly2, r19, 0
+    DELAY            ; match CLK_HI width (same as regular bit)
     CLK_LO
     jmp r28.w0
 
 ;========================================================================
-; swd_line_reset
+; clock_cycles — r14=count, output CLK pulses (DIO already set by caller).
+; Clobbers r25. Returns via r3.w2 — supports tail calls.
 ;========================================================================
-swd_line_reset:
-    jal r28.w0, tx_setup
-    DIO_HI
-    ldi r25, 55
-lr_loop:
+clock_cycles:
+    mov r25, r14
+    qbeq cc_done, r25, 0
+cc_loop:
     CLK_LO
     DELAY
     CLK_HI
     DELAY
     sub r25, r25, 1
-    qbne lr_loop, r25, 0
-    DIO_LO
-    ldi r25, 2
-idle2:
-    CLK_LO
-    DELAY
-    CLK_HI
-    DELAY
-    sub r25, r25, 1
-    qbne idle2, r25, 0
+    qbne cc_loop, r25, 0
+cc_done:
     CLK_LO
     jmp r3.w2
 
 ;========================================================================
-; swd_idle_cycles — r14 = count
+; swd_line_reset — 55 clocks DIO=HIGH + 2 clocks DIO=LOW
+;========================================================================
+swd_line_reset:
+    mov r22, r3.w2         ; save return address (jal clobbers r3.w2)
+    jal r28.w0, tx_setup
+    DIO_HI
+    ldi r14, 55
+    jal r3.w2, clock_cycles
+    DIO_LO
+    ldi r14, 2
+    jal r3.w2, clock_cycles
+    mov r3.w2, r22         ; restore return address
+    jmp r3.w2
+
+;========================================================================
+; swd_idle_cycles — r14 = count, DIO = LOW
 ;========================================================================
 swd_idle_cycles:
     jal r28.w0, tx_setup
     DIO_LO
-    mov r25, r14
-    qbeq ic_done, r25, 0
-ic_loop:
-    CLK_LO
-    DELAY
-    CLK_HI
-    DELAY
-    sub r25, r25, 1
-    qbne ic_loop, r25, 0
-ic_done:
-    CLK_LO
-    jmp r3.w2
+    jmp clock_cycles        ; tail call — r3.w2 still points to our caller
 
 ;========================================================================
 ; send_byte_seq — r14=byte ptr, r15=byte count. Called via jal r28.w0.
@@ -318,10 +302,15 @@ cs_done:
 ;========================================================================
 ; swd_read_reg — r14=SWD cmd byte (START|PARK preset), r15=data ptr
 ; Returns: r14 = ACK (1=OK, 2=WAIT, 4=FAULT)
+; Built-in WAIT retry (max 64 attempts) eliminates ARM round-trips.
 ;========================================================================
 swd_read_reg:
     mov r22, r15             ; save data pointer
+    ldi r24, 64              ; max WAIT retries
+    mov r23, r14             ; save original SWD cmd byte for retry
 
+rd_retry:
+    mov r14, r23             ; restore cmd byte
     jal r28.w0, tx_setup
     mov r26, r14
     ldi r25, 8
@@ -336,7 +325,14 @@ swd_read_reg:
     jal r28.w0, rx_bits
     mov r20, r21              ; r20 = ACK
 
-    ; Read 32-bit data
+    ; WAIT retry — if target is busy, resend entire transaction
+    qbne rd_no_wait, r20, 2   ; 2 = ACK_WAIT
+    sub r24, r24, 1
+    qbne rd_retry, r24, 0
+    ; Max retries exhausted, fall through with ACK_WAIT
+
+rd_no_wait:
+    ; Read 32-bit data (always complete transaction per SWD spec)
     ldi r21, 0
     ldi r23, 1
     ldi r25, 32
@@ -360,10 +356,15 @@ rd_pdone:
 ;========================================================================
 ; swd_write_reg — r14=SWD cmd byte, r15=value
 ; Returns: r14 = ACK
+; Built-in WAIT retry (max 64 attempts) eliminates ARM round-trips.
 ;========================================================================
 swd_write_reg:
     mov r22, r15             ; save write value
+    ldi r24, 64              ; max WAIT retries
+    mov r23, r14             ; save original SWD cmd byte for retry
 
+wr_retry:
+    mov r14, r23             ; restore cmd byte
     jal r28.w0, tx_setup
     mov r26, r14
     ldi r25, 8
@@ -378,20 +379,21 @@ swd_write_reg:
     jal r28.w0, rx_bits
     mov r20, r21
 
-    ; TRN cycle: switch to output mode (short fixed delays)
+    ; WAIT retry
+    qbne wr_no_wait, r20, 2
+    sub r24, r24, 1
+    qbne wr_retry, r24, 0
+    ; Max retries exhausted, fall through
+
+wr_no_wait:
+    ; TRN cycle: R30.t9=1 from turnaround_input → clean HIGH at mode switch
     CLK_LO
     ldi32 r16, PADCFG_DIO
     ldi32 r17, MODE_DIO_OUT
-    sbbo &r17, r16, 0, 4
-    ldi r19, 5       ; short fixed delay for L3 write (~55ns)
-wr_trn1:
-    sub r19, r19, 1
-    qbne wr_trn1, r19, 0
-    CLK_HI         ; TRN bit
-    ldi r19, 3       ; clock high (~35ns)
-wr_trn2:
-    sub r19, r19, 1
-    qbne wr_trn2, r19, 0
+    sbbo &r17, r16, 0, 4   ; DIO immediately HIGH (R30.t9 already 1)
+    DELAY            ; L3 settle + CLK_LO width
+    CLK_HI            ; TRN rising edge
+    DELAY            ; CLK_HI width
     CLK_LO
 
     ; Pre-drive bit 0 — separate from TRN cycle
