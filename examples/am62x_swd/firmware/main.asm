@@ -104,9 +104,10 @@ brd_done:
     ldi  r27, 0
     qba  finish
 
-; ---- Batch: r25 sub-commands from seq_buf (2 words each: [type:8|arg1:24][arg2:32]) ----
+; ---- Batch: r25 sub-commands from seq_buf at MB+(r26*4) (2 words each) ----
 do_batch:
-    ldi32 r2, 0x1044         ; seq_buf at MB+68
+    lsl  r2, r26, 2          ; byte offset = wdata * 4
+    add  r2, r4, r2          ; r2 = MB + offset
     mov  r6, r25             ; count
     ldi32 r5, 0x1100         ; scratch for read data
     qbeq batch_done, r6, 0
